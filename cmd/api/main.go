@@ -2,11 +2,11 @@ package main
 
 import (
 	"context"
-	"log"
 	"os/signal"
 	"syscall"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/sirupsen/logrus"
 
 	"comment-processing-service/internal/config"
 	"comment-processing-service/internal/controller"
@@ -22,18 +22,19 @@ func main() {
 
 	dsn := config.GetEnv("DATABASE_URL", "")
 	if dsn == "" {
-		log.Fatal("DATABASE_URL is required")
+		logrus.StandardLogger().Fatal("DATABASE_URL is required")
 	}
 	addr := config.GetEnv("API_ADDR", ":8080")
 
 	pool, err := db.NewPool(ctx, dsn)
 	if err != nil {
-		log.Fatalf("db connect: %v", err)
+		logrus.StandardLogger().WithError(err).Fatal("db connect")
 	}
 	defer pool.Close()
 
 	repo := repository.NewRepository(pool)
-	commentController := controller.NewCommentController(repo, log.Default())
+	logger := logrus.StandardLogger()
+	commentController := controller.NewCommentController(repo, logger)
 
 	app := fiber.New()
 	app.Get("/comments", commentController.ListComments)
@@ -44,8 +45,8 @@ func main() {
 		_ = app.Shutdown()
 	}()
 
-	log.Printf("api listening on %s", addr)
+	logger.WithField("addr", addr).Info("api listening")
 	if err := app.Listen(addr); err != nil {
-		log.Fatalf("http server error: %v", err)
+		logger.WithError(err).Fatal("http server error")
 	}
 }

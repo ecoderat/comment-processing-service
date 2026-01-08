@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"log"
 	"os"
 	"time"
 
@@ -13,6 +12,7 @@ import (
 	"comment-processing-service/proto/sentimentpb"
 
 	"github.com/redis/go-redis/v9"
+	"github.com/sirupsen/logrus"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -25,7 +25,7 @@ func main() {
 
 	dsn := config.GetEnv("DATABASE_URL", "")
 	if dsn == "" {
-		log.Fatal("DATABASE_URL is required")
+		logrus.StandardLogger().Fatal("DATABASE_URL is required")
 	}
 
 	redisAddr := config.GetEnv("REDIS_ADDR", "127.0.0.1:6379")
@@ -47,7 +47,7 @@ func main() {
 
 	pool, err := db.NewPool(ctx, dsn)
 	if err != nil {
-		log.Fatalf("db connect: %v", err)
+		logrus.StandardLogger().WithError(err).Fatal("db connect")
 	}
 	defer pool.Close()
 
@@ -61,7 +61,7 @@ func main() {
 
 	conn, err := grpc.Dial(grpcAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		log.Fatalf("grpc dial: %v", err)
+		logrus.StandardLogger().WithError(err).Fatal("grpc dial")
 	}
 	defer func() { _ = conn.Close() }()
 
@@ -80,10 +80,13 @@ func main() {
 	}
 
 	repo := repository.NewRepository(pool)
-	proc := worker.NewProcessor(repo, redisClient, client, cfg, workerID)
-	log.Printf("worker started id=%s grpc=%s", workerID, grpcAddr)
+	proc := worker.NewProcessor(repo, redisClient, client, cfg, workerID, logrus.StandardLogger())
+	logrus.StandardLogger().WithFields(logrus.Fields{
+		"worker_id": workerID,
+		"grpc":      grpcAddr,
+	}).Info("worker started")
 
 	if err := proc.Run(ctx); err != nil {
-		log.Fatalf("worker stopped: %v", err)
+		logrus.StandardLogger().WithError(err).Fatal("worker stopped")
 	}
 }

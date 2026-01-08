@@ -14,6 +14,7 @@ import (
 	"comment-processing-service/proto/sentimentpb"
 
 	redisv9 "github.com/redis/go-redis/v9"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/time/rate"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -50,6 +51,7 @@ type Processor struct {
 	Config   Config
 	WorkerID string
 	Rand     *rand.Rand
+	Logger   *logrus.Logger
 }
 
 type processedPayload struct {
@@ -61,7 +63,10 @@ type processedPayload struct {
 	ProcessedAt string `json:"processed_at"`
 }
 
-func NewProcessor(repo repository.Repository, redis *redisv9.Client, rpc sentimentpb.SentimentServiceClient, cfg Config, workerID string) *Processor {
+func NewProcessor(repo repository.Repository, redis *redisv9.Client, rpc sentimentpb.SentimentServiceClient, cfg Config, workerID string, logger *logrus.Logger) *Processor {
+	if logger == nil {
+		logger = logrus.StandardLogger()
+	}
 	limiter := rate.NewLimiter(rate.Limit(cfg.RateLimitPerSec), cfg.RateLimitPerSec)
 	return &Processor{
 		Repo:     repo,
@@ -72,6 +77,7 @@ func NewProcessor(repo repository.Repository, redis *redisv9.Client, rpc sentime
 		Config:   cfg,
 		WorkerID: workerID,
 		Rand:     rand.New(rand.NewSource(time.Now().UnixNano())),
+		Logger:   logger,
 	}
 }
 
@@ -97,7 +103,7 @@ func (p *Processor) Run(ctx context.Context) error {
 		}
 
 		if err := p.process(ctx, commentID); err != nil {
-			// Processing errors are logged by caller; keep running.
+			p.Logger.WithError(err).WithField("comment_id", commentID).Error("worker process error")
 			continue
 		}
 	}
@@ -149,7 +155,7 @@ func (p *Processor) process(ctx context.Context, commentID string) error {
 func (p *Processor) loadForProcessing(ctx context.Context, commentID string) (*repository.CommentProcessing, error) {
 	row, err := p.Repo.LoadCommentForProcessing(ctx, commentID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("load comment %s: %w", commentID, err)
 	}
 
 	if row == nil {
@@ -170,11 +176,11 @@ func (p *Processor) fetchSentiment(ctx context.Context, row *repository.CommentP
 		return label, nil
 	}
 	if err != nil && !errors.Is(err, redisv9.Nil) {
-		return "", err
+		return "", fmt.Errorf("cache get: %w", err)
 	}
 
 	if err := p.Limiter.Wait(ctx); err != nil {
-		return "", err
+		return "", fmt.Errorf("rate limit: %w", err)
 	}
 
 	rpcCtx, cancel := context.WithTimeout(ctx, p.Config.RPCTimeout)
@@ -185,11 +191,11 @@ func (p *Processor) fetchSentiment(ctx context.Context, row *repository.CommentP
 		if isRetryableRPC(err) {
 			return "", err
 		}
-		return "", err
+		return "", fmt.Errorf("rpc analyze: %w", err)
 	}
 
 	if err := p.Redis.Set(ctx, cacheKey, resp.Label, p.Config.TextCacheTTL).Err(); err != nil {
-		return "", err
+		return "", fmt.Errorf("cache set: %w", err)
 	}
 	return resp.Label, nil
 }
@@ -199,15 +205,18 @@ func (p *Processor) markSuccess(ctx context.Context, commentID, label string) er
 
 	payload, err := p.buildProcessedPayload(ctx, commentID, label, processedAt)
 	if err != nil {
-		return err
+		return fmt.Errorf("build payload %s: %w", commentID, err)
 	}
-	return p.Repo.MarkCommentProcessed(ctx, commentID, label, processedAt, payload)
+	if err := p.Repo.MarkCommentProcessed(ctx, commentID, label, processedAt, payload); err != nil {
+		return fmt.Errorf("mark processed %s: %w", commentID, err)
+	}
+	return nil
 }
 
 func (p *Processor) buildProcessedPayload(ctx context.Context, commentID, label string, processedAt time.Time) ([]byte, error) {
 	payloadRow, err := p.Repo.LoadCommentPayload(ctx, commentID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("load payload %s: %w", commentID, err)
 	}
 
 	payload := processedPayload{
@@ -232,7 +241,7 @@ func (p *Processor) markFailure(ctx context.Context, commentID string, attemptCo
 	}
 
 	if updateErr := p.Repo.MarkCommentFailure(ctx, commentID, attemptCount, lastErr, status); updateErr != nil {
-		return updateErr
+		return fmt.Errorf("mark failure %s: %w", commentID, updateErr)
 	}
 
 	if status == statusFailed {

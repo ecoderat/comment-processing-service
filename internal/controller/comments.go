@@ -2,12 +2,11 @@ package controller
 
 import (
 	"errors"
-	"log"
 	"strconv"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
-	"github.com/jackc/pgx/v5"
+	"github.com/sirupsen/logrus"
 
 	"comment-processing-service/internal/repository"
 )
@@ -19,7 +18,7 @@ type CommentController interface {
 
 type commentController struct {
 	repo   repository.Repository
-	logger *log.Logger
+	logger *logrus.Logger
 }
 
 type CommentResponse struct {
@@ -37,15 +36,19 @@ type ListResponse struct {
 	Offset   int               `json:"offset"`
 }
 
-func NewCommentController(repo repository.Repository, logger *log.Logger) CommentController {
+func NewCommentController(repo repository.Repository, logger *logrus.Logger) CommentController {
 	if logger == nil {
-		logger = log.Default()
+		logger = logrus.StandardLogger()
 	}
 	return &commentController{repo: repo, logger: logger}
 }
 
 func (c *commentController) ListComments(ctx fiber.Ctx) error {
 	start := time.Now()
+	logger := c.logger.WithFields(logrus.Fields{
+		"method": ctx.Method(),
+		"path":   ctx.Path(),
+	})
 	limit := parseInt(ctx.Query("limit"), 50)
 	if limit > 200 {
 		limit = 200
@@ -84,12 +87,15 @@ func (c *commentController) ListComments(ctx fiber.Ctx) error {
 
 	comments, err := c.repo.ListComments(ctx.Context(), params)
 	if err != nil {
-		c.logger.Printf("list comments failed: %v", err)
+		logger.WithError(err).Error("list comments failed")
 		return writeError(ctx, fiber.StatusInternalServerError, "query error")
 	}
 
 	resp := ListResponse{Comments: toResponses(comments), Limit: limit, Offset: offset}
-	c.logger.Printf("list comments ok count=%d duration_ms=%d", len(comments), time.Since(start).Milliseconds())
+	logger.WithFields(logrus.Fields{
+		"count":       len(comments),
+		"duration_ms": time.Since(start).Milliseconds(),
+	}).Info("list comments ok")
 	return ctx.Status(fiber.StatusOK).JSON(resp)
 }
 
@@ -99,17 +105,22 @@ func (c *commentController) GetComment(ctx fiber.Ctx) error {
 	if commentID == "" {
 		return writeError(ctx, fiber.StatusNotFound, "commentId required")
 	}
+	logger := c.logger.WithFields(logrus.Fields{
+		"method":     ctx.Method(),
+		"path":       ctx.Path(),
+		"comment_id": commentID,
+	})
 
 	comment, err := c.repo.GetComment(ctx.Context(), commentID)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
+		if errors.Is(err, repository.ErrCommentNotFound) {
 			return writeError(ctx, fiber.StatusNotFound, "not found")
 		}
-		c.logger.Printf("get comment failed: %v", err)
+		logger.WithError(err).Error("get comment failed")
 		return writeError(ctx, fiber.StatusInternalServerError, "query error")
 	}
 
-	c.logger.Printf("get comment ok id=%s duration_ms=%d", commentID, time.Since(start).Milliseconds())
+	logger.WithField("duration_ms", time.Since(start).Milliseconds()).Info("get comment ok")
 	return ctx.Status(fiber.StatusOK).JSON(toResponse(comment))
 }
 

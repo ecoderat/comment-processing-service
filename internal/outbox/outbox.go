@@ -2,10 +2,10 @@ package outbox
 
 import (
 	"context"
-	"log"
 	"time"
 
 	"github.com/segmentio/kafka-go"
+	"github.com/sirupsen/logrus"
 
 	"comment-processing-service/internal/repository"
 )
@@ -24,11 +24,15 @@ type service struct {
 	repo   repository.OutboxRepository
 	writer *kafka.Writer
 	cfg    Config
+	logger *logrus.Logger
 }
 
 // NewService builds an outbox service with dependencies.
-func NewService(repo repository.OutboxRepository, writer *kafka.Writer, cfg Config) Service {
-	return &service{repo: repo, writer: writer, cfg: cfg}
+func NewService(repo repository.OutboxRepository, writer *kafka.Writer, cfg Config, logger *logrus.Logger) Service {
+	if logger == nil {
+		logger = logrus.StandardLogger()
+	}
+	return &service{repo: repo, writer: writer, cfg: cfg, logger: logger}
 }
 
 // Run publishes outbox rows to Kafka.
@@ -42,7 +46,7 @@ func (s *service) Run(ctx context.Context) error {
 
 		rows, err := s.repo.FetchOutboxBatch(ctx, s.cfg.BatchSize)
 		if err != nil {
-			log.Printf("fetch error: %v", err)
+			s.logger.WithError(err).Error("outbox fetch error")
 			time.Sleep(s.cfg.LoopInterval)
 			continue
 		}
@@ -64,15 +68,18 @@ func (s *service) Run(ctx context.Context) error {
 			}
 
 			if err := s.writer.WriteMessages(ctx, msg); err != nil {
-				log.Printf("publish failed id=%d comment_id=%s: %v", r.ID, r.CommentID, err)
+				s.logger.WithError(err).WithFields(logrus.Fields{
+					"id":         r.ID,
+					"comment_id": r.CommentID,
+				}).Error("outbox publish failed")
 				if err := s.repo.MarkOutboxPublishError(ctx, r.ID, err); err != nil {
-					log.Printf("update error id=%d: %v", r.ID, err)
+					s.logger.WithError(err).WithField("id", r.ID).Error("outbox update error")
 				}
 				continue
 			}
 
 			if err := s.repo.MarkOutboxPublished(ctx, r.ID); err != nil {
-				log.Printf("mark published error id=%d: %v", r.ID, err)
+				s.logger.WithError(err).WithField("id", r.ID).Error("outbox mark published error")
 			}
 		}
 	}

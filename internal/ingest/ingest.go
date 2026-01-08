@@ -4,10 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"log"
 	"time"
 
 	"github.com/segmentio/kafka-go"
+	"github.com/sirupsen/logrus"
 
 	"comment-processing-service/internal/cache"
 	"comment-processing-service/internal/model"
@@ -24,15 +24,20 @@ type Service struct {
 	repo   repository.Repository
 	cache  cache.Cache
 	cfg    Config
+	logger *logrus.Logger
 }
 
 // NewService builds an ingest service with dependencies.
-func NewService(reader *kafka.Reader, repo repository.Repository, cacheClient cache.Cache, cfg Config) *Service {
+func NewService(reader *kafka.Reader, repo repository.Repository, cacheClient cache.Cache, cfg Config, logger *logrus.Logger) *Service {
+	if logger == nil {
+		logger = logrus.StandardLogger()
+	}
 	return &Service{
 		reader: reader,
 		repo:   repo,
 		cache:  cacheClient,
 		cfg:    cfg,
+		logger: logger,
 	}
 }
 
@@ -44,17 +49,17 @@ func (s *Service) Run(ctx context.Context) error {
 			if errors.Is(err, context.Canceled) {
 				return err
 			}
-			log.Printf("fetch error: %v", err)
+			s.logger.WithError(err).Error("ingest fetch error")
 			continue
 		}
 
 		if err := s.handleMessage(ctx, msg); err != nil {
-			log.Printf("handle error: %v", err)
+			s.logger.WithError(err).Error("ingest handle error")
 			continue
 		}
 
 		if err := s.reader.CommitMessages(ctx, msg); err != nil {
-			log.Printf("commit error: %v", err)
+			s.logger.WithError(err).Error("ingest commit error")
 		}
 	}
 }
@@ -62,18 +67,24 @@ func (s *Service) Run(ctx context.Context) error {
 func (s *Service) handleMessage(ctx context.Context, msg kafka.Message) error {
 	var payload model.RawComment
 	if err := json.Unmarshal(msg.Value, &payload); err != nil {
-		log.Printf("invalid json: %v", err)
+		s.logger.WithError(err).Warn("invalid json")
 		return nil
 	}
 
 	eventTime, err := time.Parse(time.RFC3339Nano, payload.EventTime)
 	if err != nil {
-		log.Printf("invalid event_time: %v event_id=%s comment_id=%s", err, payload.EventID, payload.CommentID)
+		s.logger.WithError(err).WithFields(logrus.Fields{
+			"event_id":   payload.EventID,
+			"comment_id": payload.CommentID,
+		}).Warn("invalid event_time")
 		return nil
 	}
 
 	if payload.EventID == "" || payload.CommentID == "" {
-		log.Printf("missing identifiers event_id=%s comment_id=%s", payload.EventID, payload.CommentID)
+		s.logger.WithFields(logrus.Fields{
+			"event_id":   payload.EventID,
+			"comment_id": payload.CommentID,
+		}).Warn("missing identifiers")
 		return nil
 	}
 
@@ -83,7 +94,10 @@ func (s *Service) handleMessage(ctx context.Context, msg kafka.Message) error {
 		return err
 	}
 	if !set {
-		log.Printf("duplicate event_id=%s comment_id=%s", payload.EventID, payload.CommentID)
+		s.logger.WithFields(logrus.Fields{
+			"event_id":   payload.EventID,
+			"comment_id": payload.CommentID,
+		}).Info("duplicate event")
 		return nil
 	}
 
@@ -102,13 +116,16 @@ func (s *Service) handleMessage(ctx context.Context, msg kafka.Message) error {
 	}
 
 	if !upserted {
-		log.Printf("ignored older event_id=%s comment_id=%s", payload.EventID, payload.CommentID)
+		s.logger.WithFields(logrus.Fields{
+			"event_id":   payload.EventID,
+			"comment_id": payload.CommentID,
+		}).Info("ignored older event")
 		return nil
 	}
 
 	for {
 		if err := s.cache.EnqueueRetry(ctx, payload.CommentID); err != nil {
-			log.Printf("enqueue error comment_id=%s: %v", payload.CommentID, err)
+			s.logger.WithError(err).WithField("comment_id", payload.CommentID).Error("enqueue retry error")
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -119,6 +136,10 @@ func (s *Service) handleMessage(ctx context.Context, msg kafka.Message) error {
 		break
 	}
 
-	log.Printf("ingested event_id=%s comment_id=%s text_hash=%s", payload.EventID, payload.CommentID, textHash)
+	s.logger.WithFields(logrus.Fields{
+		"event_id":   payload.EventID,
+		"comment_id": payload.CommentID,
+		"text_hash":  textHash,
+	}).Info("ingested comment")
 	return nil
 }

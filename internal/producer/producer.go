@@ -5,7 +5,6 @@ import (
 	crand "crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"log"
 	"math"
 	"math/big"
 	"math/rand"
@@ -13,6 +12,7 @@ import (
 	"time"
 
 	"github.com/segmentio/kafka-go"
+	"github.com/sirupsen/logrus"
 
 	"comment-processing-service/internal/model"
 )
@@ -37,10 +37,14 @@ type service struct {
 	cfg    Config
 	writer *kafka.Writer
 	rng    *rand.Rand
+	logger *logrus.Logger
 }
 
 // NewService builds a producer service with its writer and RNG.
-func NewService(cfg Config) Service {
+func NewService(cfg Config, logger *logrus.Logger) Service {
+	if logger == nil {
+		logger = logrus.StandardLogger()
+	}
 	writer := kafka.NewWriter(kafka.WriterConfig{
 		Brokers:  cfg.Brokers,
 		Topic:    cfg.Topic,
@@ -50,6 +54,7 @@ func NewService(cfg Config) Service {
 		cfg:    cfg,
 		writer: writer,
 		rng:    rand.New(rand.NewSource(cfg.Seed)),
+		logger: logger,
 	}
 }
 
@@ -59,7 +64,10 @@ func (s *service) Run(ctx context.Context) error {
 		_ = s.writer.Close()
 	}()
 
-	log.Printf("producer started topic=%s brokers=%s", s.cfg.Topic, strings.Join(s.cfg.Brokers, ","))
+	s.logger.WithFields(logrus.Fields{
+		"topic":   s.cfg.Topic,
+		"brokers": strings.Join(s.cfg.Brokers, ","),
+	}).Info("producer started")
 
 	var recentTexts []string
 	burstRemaining := 0
@@ -85,7 +93,7 @@ func (s *service) Run(ctx context.Context) error {
 
 		payload, err := json.Marshal(msg)
 		if err != nil {
-			log.Printf("marshal error: %v", err)
+			s.logger.WithError(err).Error("marshal error")
 			continue
 		}
 
@@ -95,9 +103,13 @@ func (s *service) Run(ctx context.Context) error {
 		}
 
 		if err := s.writer.WriteMessages(ctx, kmsg); err != nil {
-			log.Printf("kafka write error: %v", err)
+			s.logger.WithError(err).Error("kafka write error")
 		} else {
-			log.Printf("sent comment_id=%s event_id=%s size=%d", msg.CommentID, msg.EventID, len(msg.Text))
+			s.logger.WithFields(logrus.Fields{
+				"comment_id": msg.CommentID,
+				"event_id":   msg.EventID,
+				"text_size":  len(msg.Text),
+			}).Info("sent comment")
 		}
 
 		if burstRemaining > 0 {

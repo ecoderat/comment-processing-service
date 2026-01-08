@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"log"
 	"strings"
 	"time"
 
@@ -13,6 +12,7 @@ import (
 	"comment-processing-service/internal/repository"
 
 	"github.com/segmentio/kafka-go"
+	"github.com/sirupsen/logrus"
 )
 
 func main() {
@@ -22,7 +22,7 @@ func main() {
 
 	dsn := config.GetEnv("DATABASE_URL", "")
 	if dsn == "" {
-		log.Fatal("DATABASE_URL is required")
+		logrus.StandardLogger().Fatal("DATABASE_URL is required")
 	}
 	brokers := config.GetEnv("KAFKA_BROKERS", "127.0.0.1:9092")
 	defaultTopic := config.GetEnv("KAFKA_PROCESSED_TOPIC", "processed-comments")
@@ -31,7 +31,7 @@ func main() {
 
 	pool, err := db.NewPool(ctx, dsn)
 	if err != nil {
-		log.Fatalf("db connect: %v", err)
+		logrus.StandardLogger().WithError(err).Fatal("db connect")
 	}
 	defer pool.Close()
 
@@ -39,7 +39,7 @@ func main() {
 
 	brokerList := strings.Split(brokers, ",")
 	if err := kafkautil.EnsureTopics(brokerList, []string{defaultTopic}); err != nil {
-		log.Fatalf("ensure topic: %v", err)
+		logrus.StandardLogger().WithError(err).Fatal("ensure topic")
 	}
 
 	writer := kafka.NewWriter(kafka.WriterConfig{
@@ -48,15 +48,18 @@ func main() {
 	})
 	defer func() { _ = writer.Close() }()
 
-	log.Printf("outbox publisher started brokers=%s topic=%s", brokers, defaultTopic)
+	logrus.StandardLogger().WithFields(logrus.Fields{
+		"brokers": brokers,
+		"topic":   defaultTopic,
+	}).Info("outbox publisher started")
 
 	cfg := outbox.Config{
 		DefaultTopic: defaultTopic,
 		BatchSize:    batchSize,
 		LoopInterval: loopInterval,
 	}
-	service := outbox.NewService(repo, writer, cfg)
+	service := outbox.NewService(repo, writer, cfg, logrus.StandardLogger())
 	if err := service.Run(ctx); err != nil {
-		log.Fatalf("outbox stopped: %v", err)
+		logrus.StandardLogger().WithError(err).Fatal("outbox stopped")
 	}
 }

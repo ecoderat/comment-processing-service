@@ -2,7 +2,6 @@ package sentiment
 
 import (
 	"context"
-	"log"
 	"math/rand"
 	"net"
 	"sync"
@@ -10,6 +9,7 @@ import (
 
 	"comment-processing-service/proto/sentimentpb"
 
+	"github.com/sirupsen/logrus"
 	"golang.org/x/time/rate"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -41,7 +41,7 @@ func Run(addr string) error {
 
 	grpcServer := grpc.NewServer()
 	sentimentpb.RegisterSentimentServiceServer(grpcServer, newServer())
-	log.Printf("sentiment-grpc listening on %s", lis.Addr())
+	logrus.StandardLogger().WithField("addr", lis.Addr().String()).Info("sentiment-grpc listening")
 	return grpcServer.Serve(lis)
 }
 

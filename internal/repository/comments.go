@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"strings"
 	"time"
@@ -9,6 +10,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+var ErrCommentNotFound = errors.New("comment not found")
 
 type Comment struct {
 	CommentID   string
@@ -148,6 +151,9 @@ WHERE comment_id = $1
 		&comment.EventTime,
 		&comment.ProcessedAt,
 	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Comment{}, ErrCommentNotFound
+		}
 		return Comment{}, err
 	}
 
@@ -190,6 +196,9 @@ WHERE comment_id = $1
 		&payload.EventTime,
 		&payload.Text,
 	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return CommentPayload{}, ErrCommentNotFound
+		}
 		return CommentPayload{}, err
 	}
 	return payload, nil

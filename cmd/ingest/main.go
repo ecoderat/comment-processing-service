@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"log"
 	"os"
 	"strings"
 	"time"
@@ -15,6 +14,7 @@ import (
 	"comment-processing-service/internal/repository"
 
 	kafka "github.com/segmentio/kafka-go"
+	"github.com/sirupsen/logrus"
 )
 
 func main() {
@@ -33,12 +33,12 @@ func main() {
 
 	dsn := config.GetEnv("DATABASE_URL", "")
 	if dsn == "" {
-		log.Fatal("DATABASE_URL is required")
+		logrus.StandardLogger().Fatal("DATABASE_URL is required")
 	}
 
 	pool, err := db.NewPool(ctx, dsn)
 	if err != nil {
-		log.Fatalf("db connect: %v", err)
+		logrus.StandardLogger().WithError(err).Fatal("db connect")
 	}
 	defer pool.Close()
 
@@ -49,7 +49,7 @@ func main() {
 
 	brokerList := strings.Split(brokers, ",")
 	if err := kafkautil.EnsureTopics(brokerList, []string{topic}); err != nil {
-		log.Fatalf("ensure topic: %v", err)
+		logrus.StandardLogger().WithError(err).Fatal("ensure topic")
 	}
 
 	reader := kafka.NewReader(kafka.ReaderConfig{
@@ -64,11 +64,15 @@ func main() {
 		_ = reader.Close()
 	}()
 
-	log.Printf("ingest started topic=%s brokers=%s group=%s", topic, brokers, groupID)
+	logrus.StandardLogger().WithFields(logrus.Fields{
+		"topic":   topic,
+		"brokers": brokers,
+		"group":   groupID,
+	}).Info("ingest started")
 
 	repo := repository.NewRepository(pool)
-	service := ingest.NewService(reader, repo, cacheClient, ingest.Config{IdempotencyTTL: idempotencyTTL})
+	service := ingest.NewService(reader, repo, cacheClient, ingest.Config{IdempotencyTTL: idempotencyTTL}, logrus.StandardLogger())
 	if err := service.Run(ctx); err != nil {
-		log.Fatalf("ingest stopped: %v", err)
+		logrus.StandardLogger().WithError(err).Fatal("ingest stopped")
 	}
 }

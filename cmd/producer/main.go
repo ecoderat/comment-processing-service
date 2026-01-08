@@ -3,13 +3,14 @@ package main
 import (
 	"context"
 	"flag"
-	"log"
 	"strings"
 	"time"
 
 	"comment-processing-service/internal/config"
 	kafkautil "comment-processing-service/internal/kafka"
 	"comment-processing-service/internal/producer"
+
+	"github.com/sirupsen/logrus"
 )
 
 func main() {
@@ -30,7 +31,7 @@ func main() {
 	ctx := context.Background()
 	brokerList := strings.Split(brokers, ",")
 	if err := kafkautil.EnsureTopics(brokerList, []string{topic}); err != nil {
-		log.Fatalf("ensure topic: %v", err)
+		logrus.StandardLogger().WithError(err).Fatal("ensure topic")
 	}
 
 	cfg := producer.Config{
@@ -45,8 +46,8 @@ func main() {
 		Seed:          seed,
 	}
 
-	service := producer.NewService(cfg)
+	service := producer.NewService(cfg, logrus.StandardLogger())
 	if err := service.Run(ctx); err != nil {
-		log.Fatalf("producer stopped: %v", err)
+		logrus.StandardLogger().WithError(err).Fatal("producer stopped")
 	}
 }
