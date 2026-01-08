@@ -75,6 +75,17 @@ services:
     ports:
       - "50051:50051"
 
+  migrate:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: migrate
+    command: ["up", "-config=/app/dbconfig.yml", "-env=docker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
   api:
     build:
       context: ..
@@ -86,6 +97,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     ports:
       - "8080:8080"
     restart: unless-stopped
@@ -111,6 +124,8 @@ services:
         condition: service_completed_successfully
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   worker:
@@ -131,6 +146,8 @@ services:
         condition: service_healthy
       sentiment-grpc:
         condition: service_started
+      migrate:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   outbox-publisher:
@@ -148,6 +165,8 @@ services:
       redpanda:
         condition: service_healthy
       init-topics:
+        condition: service_completed_successfully
+      migrate:
         condition: service_completed_successfully
     restart: unless-stopped
 

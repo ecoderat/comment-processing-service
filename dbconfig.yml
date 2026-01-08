@@ -2,3 +2,8 @@ development:
   dialect: postgres
   datasource: postgres://comment:comment@localhost:5432/comment?sslmode=disable
   dir: migrations
+docker:
+  dialect: postgres
+  datasource: postgres://comment:comment@postgres:5432/comment?sslmode=disable
+  dir: migrations
+  table: migrations

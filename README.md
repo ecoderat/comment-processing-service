@@ -247,20 +247,6 @@ go run ./cmd/api
 go run ./cmd/producer -interval=1s -size=24 -reuse-percent=20
 ```
 
----
-
-## Migrations
-
-Migrations live under `migrations/`.
-
-Example:
-
-```bash
-DATABASE_URL="postgres://comment:comment@localhost:5432/comment?sslmode=disable" \
-  go run ./cmd/migrate
-```
-
----
 
 ## REST API
 
@@ -330,18 +316,6 @@ See `internal/config/` for the full set and defaults.
 
 ## Future improvements
 
-* **Health endpoints** (`/healthz`) + stronger docker-compose healthchecks for app containers
-  Improves “ready” semantics and startup ordering.
-
-* **DLQ topic** for permanently failed comments
-  e.g., `comments-dlq` plus replay tooling.
-
-* **Minimal metrics (no tracing required)**
-  Counters for processed/failed, gRPC errors, retry scheduled, publish failures.
-
-* **Better pagination**
-  Cursor-based pagination for `/comments` (more stable than offset under heavy inserts).
-
 * **PostgreSQL + ClickHouse (optional analytics read model)**
   If you later introduce **numeric ratings** (e.g., 1–5 stars) and/or need more **analytics-heavy** queries, you can evolve into a split design:
 
@@ -354,14 +328,12 @@ See `internal/config/` for the full set and defaults.
 
     * “Hourly average rating + sentiment counts for the last 7 days”
     * “Rolling 7-day average rating, broken down by sentiment”
-  * **Distributions / percentiles**
 
-    * “p50 / p90 / p99 rating by day”
-    * “Rating histogram (1–5 star buckets) per sentiment”
   * **Top-N / worst-N slices**
 
     * “Top 10 hours with the highest negative sentiment share”
     * “Days where average rating dropped the most vs. the previous day”
+
   * **Operational analytics**
 
     * “Processing latency percentiles (`processed_at - event_time`) over time”
@@ -374,11 +346,3 @@ See `internal/config/` for the full set and defaults.
 ```bash
 go test ./...
 ```
-
-Recommended core coverage:
-
-* event_id idempotency behavior (duplicate skip)
-* out-of-order upsert rule (newer wins)
-* worker backoff/jitter scheduling
-* outbox publisher marks rows as published
-* REST handlers filters/pagination (with a fake store)
