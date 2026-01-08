@@ -1,0 +1,64 @@
+package main
+
+import (
+	"context"
+	"log"
+	"strings"
+	"time"
+
+	"comment-processing-service/internal/config"
+	"comment-processing-service/internal/db"
+	"comment-processing-service/internal/ingest"
+	"comment-processing-service/internal/redis"
+
+	kafka "github.com/segmentio/kafka-go"
+)
+
+func main() {
+	config.LoadEnv()
+
+	ctx := context.Background()
+
+	brokers := config.GetEnv("KAFKA_BROKERS", "127.0.0.1:9092")
+	topic := config.GetEnv("KAFKA_TOPIC", "raw-comments")
+	groupID := config.GetEnv("KAFKA_GROUP_ID", "comment-ingest")
+
+	redisAddr := config.GetEnv("REDIS_ADDR", "127.0.0.1:6379")
+	redisPassword := config.GetEnv("REDIS_PASSWORD", "password")
+	redisDB := config.GetEnvInt("REDIS_DB", 0)
+	idempotencyTTL := config.GetEnvDuration("IDEMPOTENCY_TTL", 24*time.Hour)
+
+	dsn := config.GetEnv("DATABASE_URL", "")
+	if dsn == "" {
+		log.Fatal("DATABASE_URL is required")
+	}
+
+	pool, err := db.NewPool(ctx, dsn)
+	if err != nil {
+		log.Fatalf("db connect: %v", err)
+	}
+	defer pool.Close()
+
+	redisClient := redis.NewClient(redisAddr, redisPassword, redisDB)
+	defer func() {
+		_ = redisClient.Close()
+	}()
+
+	reader := kafka.NewReader(kafka.ReaderConfig{
+		Brokers:        strings.Split(brokers, ","),
+		Topic:          topic,
+		GroupID:        groupID,
+		MinBytes:       1e3,
+		MaxBytes:       10e6,
+		CommitInterval: 0,
+	})
+	defer func() {
+		_ = reader.Close()
+	}()
+
+	log.Printf("ingest started topic=%s brokers=%s group=%s", topic, brokers, groupID)
+
+	if err := ingest.Run(ctx, reader, pool, redisClient, ingest.Config{IdempotencyTTL: idempotencyTTL}); err != nil {
+		log.Fatalf("ingest stopped: %v", err)
+	}
+}
