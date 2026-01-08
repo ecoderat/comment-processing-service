@@ -54,6 +54,7 @@ func (s *service) Run(ctx context.Context) error {
 			time.Sleep(s.cfg.LoopInterval)
 			continue
 		}
+		s.logger.WithField("count", len(rows)).Info("outbox batch fetched")
 
 		for _, r := range rows {
 			topic := r.Topic
@@ -80,6 +81,12 @@ func (s *service) Run(ctx context.Context) error {
 
 			if err := s.repo.MarkOutboxPublished(ctx, r.ID); err != nil {
 				s.logger.WithError(err).WithField("id", r.ID).Error("outbox mark published error")
+			} else {
+				s.logger.WithFields(logrus.Fields{
+					"id":         r.ID,
+					"comment_id": r.CommentID,
+					"topic":      msg.Topic,
+				}).Info("outbox published")
 			}
 		}
 	}

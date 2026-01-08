@@ -47,10 +47,12 @@ func Run(addr string) error {
 
 func (s *server) Analyze(ctx context.Context, req *sentimentpb.AnalyzeRequest) (*sentimentpb.AnalyzeResponse, error) {
 	if !s.limiter.Allow() {
+		logrus.StandardLogger().Warn("sentiment rate limit exceeded")
 		return nil, status.Error(codes.ResourceExhausted, "rate limit exceeded")
 	}
 
 	if s.randIntn(100) < 5 {
+		logrus.StandardLogger().Warn("sentiment random drop")
 		return nil, status.Error(codes.Unavailable, "random drop")
 	}
 
@@ -63,6 +65,7 @@ func (s *server) Analyze(ctx context.Context, req *sentimentpb.AnalyzeRequest) (
 		select {
 		case <-ctx.Done():
 			timer.Stop()
+			logrus.StandardLogger().WithError(ctx.Err()).Warn("sentiment request cancelled")
 			return nil, status.Error(codes.DeadlineExceeded, "client cancelled")
 		case <-timer.C:
 		}
@@ -77,6 +80,10 @@ func (s *server) Analyze(ctx context.Context, req *sentimentpb.AnalyzeRequest) (
 	}
 	s.mu.Unlock()
 
+	logrus.StandardLogger().WithFields(logrus.Fields{
+		"label":       label,
+		"text_length": len(text),
+	}).Info("sentiment analyzed")
 	return &sentimentpb.AnalyzeResponse{Label: label}, nil
 }
 

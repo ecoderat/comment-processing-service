@@ -1,0 +1,180 @@
+version: "3.8"
+
+services:
+  redpanda:
+    image: redpandadata/redpanda:v23.2.15
+    command:
+      - redpanda
+      - start
+      - --smp
+      - "1"
+      - --reserve-memory
+      - 0M
+      - --overprovisioned
+      - --node-id
+      - "0"
+      - --kafka-addr
+      - PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr
+      - PLAINTEXT://redpanda:9092
+    ports:
+      - "9092:9092"
+      - "9644:9644"
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "info", "--brokers=redpanda:9092"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Create topics once redpanda is healthy.
+  init-topics:
+    image: redpandadata/redpanda:v23.2.15
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      rpk topic create raw-comments processed-comments
+      --brokers=redpanda:9092
+      --partitions 3
+      --replicas 1
+      || true
+    restart: "no"
+
+  redis:
+    image: redis:7.2
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: comment
+      POSTGRES_PASSWORD: comment
+      POSTGRES_DB: comment
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U comment -d comment"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  sentiment-grpc:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: sentiment-grpc
+    ports:
+      - "50051:50051"
+
+  api:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: api
+    environment:
+      DATABASE_URL: postgres://comment:comment@postgres:5432/comment?sslmode=disable
+      API_ADDR: :8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+  ingest:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: ingest
+    environment:
+      DATABASE_URL: postgres://comment:comment@postgres:5432/comment?sslmode=disable
+      KAFKA_BROKERS: redpanda:9092
+      KAFKA_TOPIC: raw-comments
+      KAFKA_GROUP_ID: comment-ingest
+      REDIS_ADDR: redis:6379
+      REDIS_DB: 0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+      init-topics:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: worker
+    environment:
+      DATABASE_URL: postgres://comment:comment@postgres:5432/comment?sslmode=disable
+      REDIS_ADDR: redis:6379
+      REDIS_DB: 0
+      SENTIMENT_GRPC_ADDR: sentiment-grpc:50051
+      RETRY_ZSET: retry:zset
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      sentiment-grpc:
+        condition: service_started
+    restart: unless-stopped
+
+  outbox-publisher:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: outbox-publisher
+    environment:
+      DATABASE_URL: postgres://comment:comment@postgres:5432/comment?sslmode=disable
+      KAFKA_BROKERS: redpanda:9092
+      KAFKA_PROCESSED_TOPIC: processed-comments
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+      init-topics:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  producer:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: producer
+    command: ["-interval=1s", "-size=24", "-reuse-percent=20"]
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+      KAFKA_TOPIC: raw-comments
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      init-topics:
+        condition: service_completed_successfully
+      ingest:
+        condition: service_started
+    restart: unless-stopped
+
+  dozzle:
+    image: amir20/dozzle:latest
+    ports:
+      - "8088:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+volumes:
+  pgdata:

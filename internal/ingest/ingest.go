@@ -43,6 +43,7 @@ func NewService(reader *kafka.Reader, repo repository.Repository, cacheClient ca
 
 // Run consumes Kafka messages, stores comments, and enqueues retries.
 func (s *Service) Run(ctx context.Context) error {
+	s.logger.WithField("idempotency_ttl", s.cfg.IdempotencyTTL.String()).Info("ingest service started")
 	for {
 		msg, err := s.reader.FetchMessage(ctx)
 		if err != nil {
@@ -65,6 +66,7 @@ func (s *Service) Run(ctx context.Context) error {
 }
 
 func (s *Service) handleMessage(ctx context.Context, msg kafka.Message) error {
+	start := time.Now()
 	var payload model.RawComment
 	if err := json.Unmarshal(msg.Value, &payload); err != nil {
 		s.logger.WithError(err).Warn("invalid json")
@@ -87,6 +89,10 @@ func (s *Service) handleMessage(ctx context.Context, msg kafka.Message) error {
 		}).Warn("missing identifiers")
 		return nil
 	}
+	s.logger.WithFields(logrus.Fields{
+		"event_id":   payload.EventID,
+		"comment_id": payload.CommentID,
+	}).Debug("ingest message received")
 
 	eventID := payload.EventID
 	set, err := s.cache.CheckAndMarkEvent(ctx, eventID, s.cfg.IdempotencyTTL)
@@ -137,9 +143,10 @@ func (s *Service) handleMessage(ctx context.Context, msg kafka.Message) error {
 	}
 
 	s.logger.WithFields(logrus.Fields{
-		"event_id":   payload.EventID,
-		"comment_id": payload.CommentID,
-		"text_hash":  textHash,
+		"event_id":    payload.EventID,
+		"comment_id":  payload.CommentID,
+		"text_hash":   textHash,
+		"duration_ms": time.Since(start).Milliseconds(),
 	}).Info("ingested comment")
 	return nil
 }

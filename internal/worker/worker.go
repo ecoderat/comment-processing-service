@@ -82,6 +82,10 @@ func NewProcessor(repo repository.Repository, redis *redisv9.Client, rpc sentime
 }
 
 func (p *Processor) Run(ctx context.Context) error {
+	p.Logger.WithFields(logrus.Fields{
+		"worker_id":  p.WorkerID,
+		"retry_zset": p.Config.RetryZSet,
+	}).Info("worker started")
 	for {
 		select {
 		case <-ctx.Done():
@@ -149,7 +153,14 @@ func (p *Processor) process(ctx context.Context, commentID string) error {
 		return p.markFailure(ctx, commentID, row.AttemptCount, err)
 	}
 
-	return p.markSuccess(ctx, commentID, label)
+	if err := p.markSuccess(ctx, commentID, label); err != nil {
+		return err
+	}
+	p.Logger.WithFields(logrus.Fields{
+		"comment_id": commentID,
+		"label":      label,
+	}).Info("comment processed")
+	return nil
 }
 
 func (p *Processor) loadForProcessing(ctx context.Context, commentID string) (*repository.CommentProcessing, error) {
@@ -245,10 +256,19 @@ func (p *Processor) markFailure(ctx context.Context, commentID string, attemptCo
 	}
 
 	if status == statusFailed {
+		p.Logger.WithFields(logrus.Fields{
+			"comment_id":    commentID,
+			"attempt_count": attemptCount,
+		}).Warn("comment marked failed")
 		return nil
 	}
 
 	nextAttempt := time.Now().Add(p.retryDelay(attemptCount))
+	p.Logger.WithFields(logrus.Fields{
+		"comment_id":    commentID,
+		"attempt_count": attemptCount,
+		"next_attempt":  nextAttempt.UTC().Format(time.RFC3339Nano),
+	}).Info("comment retry scheduled")
 	return p.Redis.ZAdd(ctx, p.Config.RetryZSet, redisv9.Z{
 		Score:  float64(nextAttempt.UnixMilli()),
 		Member: commentID,
