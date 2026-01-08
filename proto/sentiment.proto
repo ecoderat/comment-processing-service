@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package sentiment.v1;
+
+option go_package = "comment-processing-service/proto/sentimentpb";
+
+service SentimentService {
+  rpc Analyze(AnalyzeRequest) returns (AnalyzeResponse);
+}
+
+message AnalyzeRequest {
+  string text = 1;
+}
+
+message AnalyzeResponse {
+  string label = 1;
+}
