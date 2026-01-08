@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"comment-processing-service/internal/config"
+	kafkautil "comment-processing-service/internal/kafka"
 	"comment-processing-service/internal/producer"
 )
 
@@ -27,9 +28,13 @@ func main() {
 	seed := time.Now().UnixNano()
 
 	ctx := context.Background()
+	brokerList := strings.Split(brokers, ",")
+	if err := kafkautil.EnsureTopics(brokerList, []string{topic}); err != nil {
+		log.Fatalf("ensure topic: %v", err)
+	}
 
 	cfg := producer.Config{
-		Brokers:       strings.Split(brokers, ","),
+		Brokers:       brokerList,
 		Topic:         topic,
 		Interval:      *interval,
 		BurstPercent:  burstPercent,

@@ -14,7 +14,7 @@ Copy `.env.example` to `.env` and edit as needed. The apps load `.env` automatic
 ## Infra Setup
 
 ```bash
-$ docker-compose up -d
+$ docker compose -f deploy/docker-compose.yml up -d
 ```
 
 ## Migrations
@@ -26,6 +26,21 @@ $ sql-migrate up
 ## Run Apps
 
 Run the following commands in separate terminal windows.
+
+Sentiment gRPC service:
+```
+go run ./cmd/sentiment-grpc
+```
+
+Outbox publisher:
+```
+go run ./cmd/outbox-publisher
+```
+
+Worker:
+```
+go run ./cmd/worker
+```
 
 Ingest consumer:
 ```

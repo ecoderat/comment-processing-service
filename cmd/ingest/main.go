@@ -3,12 +3,14 @@ package main
 import (
 	"context"
 	"log"
+	"os"
 	"strings"
 	"time"
 
 	"comment-processing-service/internal/config"
 	"comment-processing-service/internal/db"
 	"comment-processing-service/internal/ingest"
+	kafkautil "comment-processing-service/internal/kafka"
 	"comment-processing-service/internal/redis"
 
 	kafka "github.com/segmentio/kafka-go"
@@ -24,7 +26,7 @@ func main() {
 	groupID := config.GetEnv("KAFKA_GROUP_ID", "comment-ingest")
 
 	redisAddr := config.GetEnv("REDIS_ADDR", "127.0.0.1:6379")
-	redisPassword := config.GetEnv("REDIS_PASSWORD", "password")
+	redisPassword := os.Getenv("REDIS_PASSWORD")
 	redisDB := config.GetEnvInt("REDIS_DB", 0)
 	idempotencyTTL := config.GetEnvDuration("IDEMPOTENCY_TTL", 24*time.Hour)
 
@@ -44,8 +46,13 @@ func main() {
 		_ = redisClient.Close()
 	}()
 
+	brokerList := strings.Split(brokers, ",")
+	if err := kafkautil.EnsureTopics(brokerList, []string{topic}); err != nil {
+		log.Fatalf("ensure topic: %v", err)
+	}
+
 	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers:        strings.Split(brokers, ","),
+		Brokers:        brokerList,
 		Topic:          topic,
 		GroupID:        groupID,
 		MinBytes:       1e3,

@@ -7,12 +7,11 @@
 package sentimentpb
 
 import (
+	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
+	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	reflect "reflect"
 	sync "sync"
 	unsafe "unsafe"
-
-	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
-	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 )
 
 const (
@@ -120,7 +119,7 @@ const file_sentiment_proto_rawDesc = "" +
 	"\x0fAnalyzeResponse\x12\x14\n" +
 	"\x05label\x18\x01 \x01(\tR\x05label2Z\n" +
 	"\x10SentimentService\x12F\n" +
-	"\aAnalyze\x12\x1c.sentiment.v1.AnalyzeRequest\x1a\x1d.sentiment.v1.AnalyzeResponseB#Z!comment-processing-service/proto/sentimentpbb\x06proto3"
+	"\aAnalyze\x12\x1c.sentiment.v1.AnalyzeRequest\x1a\x1d.sentiment.v1.AnalyzeResponseB.Z,comment-processing-service/proto/sentimentpbb\x06proto3"
 
 var (
 	file_sentiment_proto_rawDescOnce sync.Once
