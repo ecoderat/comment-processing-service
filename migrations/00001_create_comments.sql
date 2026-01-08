@@ -1,4 +1,4 @@
--- +goose Up
+-- +migrate Up
 CREATE TABLE IF NOT EXISTS comments (
   comment_id TEXT PRIMARY KEY,
   event_id TEXT NOT NULL,
@@ -18,5 +18,5 @@ CREATE INDEX IF NOT EXISTS idx_comments_status_event_time ON comments (status, e
 CREATE INDEX IF NOT EXISTS idx_comments_sentiment_event_time ON comments (sentiment, event_time DESC);
 CREATE INDEX IF NOT EXISTS idx_comments_text_hash ON comments (text_hash);
 
--- +goose Down
+-- +migrate Down
 DROP TABLE IF EXISTS comments;

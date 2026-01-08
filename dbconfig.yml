@@ -1,0 +1,4 @@
+development:
+  dialect: postgres
+  datasource: postgres://comment:comment@localhost:5432/comment?sslmode=disable
+  dir: migrations
