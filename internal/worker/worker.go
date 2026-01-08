@@ -2,8 +2,6 @@ package worker
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,10 +9,10 @@ import (
 	"math/rand"
 	"time"
 
+	"comment-processing-service/internal/repository"
+	"comment-processing-service/internal/text"
 	"comment-processing-service/proto/sentimentpb"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	redisv9 "github.com/redis/go-redis/v9"
 	"golang.org/x/time/rate"
 	"google.golang.org/grpc/codes"
@@ -33,8 +31,18 @@ type Config struct {
 	RPCTimeout      time.Duration
 }
 
+const (
+	statusProcessed = "processed"
+	statusPending   = "pending"
+	statusFailed    = "failed"
+
+	lockKeyPrefix       = "lock:comment:"
+	sentimentCachePrefx = "sentiment:text:"
+	pollSleep           = 200 * time.Millisecond
+)
+
 type Processor struct {
-	DB       *pgxpool.Pool
+	Repo     repository.Repository
 	Redis    *redisv9.Client
 	Limiter  *rate.Limiter
 	RPC      sentimentpb.SentimentServiceClient
@@ -42,14 +50,6 @@ type Processor struct {
 	Config   Config
 	WorkerID string
 	Rand     *rand.Rand
-}
-
-type commentRow struct {
-	CommentID    string
-	Text         string
-	TextHash     string
-	Status       string
-	AttemptCount int
 }
 
 type processedPayload struct {
@@ -61,10 +61,10 @@ type processedPayload struct {
 	ProcessedAt string `json:"processed_at"`
 }
 
-func NewProcessor(db *pgxpool.Pool, redis *redisv9.Client, rpc sentimentpb.SentimentServiceClient, cfg Config, workerID string) *Processor {
+func NewProcessor(repo repository.Repository, redis *redisv9.Client, rpc sentimentpb.SentimentServiceClient, cfg Config, workerID string) *Processor {
 	limiter := rate.NewLimiter(rate.Limit(cfg.RateLimitPerSec), cfg.RateLimitPerSec)
 	return &Processor{
-		DB:       db,
+		Repo:     repo,
 		Redis:    redis,
 		Limiter:  limiter,
 		RPC:      rpc,
@@ -83,27 +83,27 @@ func (p *Processor) Run(ctx context.Context) error {
 		default:
 		}
 
-		commentID, err := p.popDue(ctx)
+		commentID, err := p.dequeueDue(ctx)
 		if err != nil {
 			if errors.Is(err, redisv9.Nil) {
-				time.Sleep(200 * time.Millisecond)
+				time.Sleep(pollSleep)
 				continue
 			}
 			return err
 		}
 		if commentID == "" {
-			time.Sleep(200 * time.Millisecond)
+			time.Sleep(pollSleep)
 			continue
 		}
 
-		if err := p.processComment(ctx, commentID); err != nil {
+		if err := p.process(ctx, commentID); err != nil {
 			// Processing errors are logged by caller; keep running.
 			continue
 		}
 	}
 }
 
-func (p *Processor) popDue(ctx context.Context) (string, error) {
+func (p *Processor) dequeueDue(ctx context.Context) (string, error) {
 	res, err := p.RetryLua.Run(ctx, p.Redis, []string{p.Config.RetryZSet}, time.Now().UnixMilli()).Result()
 	if err != nil {
 		return "", err
@@ -114,8 +114,8 @@ func (p *Processor) popDue(ctx context.Context) (string, error) {
 	return fmt.Sprint(res), nil
 }
 
-func (p *Processor) processComment(ctx context.Context, commentID string) error {
-	lockKey := "lock:comment:" + commentID
+func (p *Processor) process(ctx context.Context, commentID string) error {
+	lockKey := lockKeyPrefix + commentID
 	locked, err := p.Redis.SetNX(ctx, lockKey, p.WorkerID, p.Config.LockTTL).Result()
 	if err != nil {
 		return err
@@ -127,47 +127,44 @@ func (p *Processor) processComment(ctx context.Context, commentID string) error 
 		_, _ = p.Redis.Del(ctx, lockKey).Result()
 	}()
 
-	row, err := p.loadComment(ctx, commentID)
+	row, err := p.loadForProcessing(ctx, commentID)
 	if err != nil {
 		return err
 	}
 	if row == nil {
 		return nil
 	}
-	if row.Status == "processed" {
+	if row.Status == statusProcessed {
 		return nil
 	}
 
-	label, err := p.getSentiment(ctx, row)
+	label, err := p.fetchSentiment(ctx, row)
 	if err != nil {
-		return p.handleFailure(ctx, commentID, row.AttemptCount, err)
+		return p.markFailure(ctx, commentID, row.AttemptCount, err)
 	}
 
-	return p.handleSuccess(ctx, commentID, label)
+	return p.markSuccess(ctx, commentID, label)
 }
 
-func (p *Processor) loadComment(ctx context.Context, commentID string) (*commentRow, error) {
-	var row commentRow
-	const query = `
-SELECT comment_id, text, text_hash, status, attempt_count
-FROM comments
-WHERE comment_id = $1
-`
-	err := p.DB.QueryRow(ctx, query, commentID).Scan(&row.CommentID, &row.Text, &row.TextHash, &row.Status, &row.AttemptCount)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, nil
-	}
+func (p *Processor) loadForProcessing(ctx context.Context, commentID string) (*repository.CommentProcessing, error) {
+	row, err := p.Repo.LoadCommentForProcessing(ctx, commentID)
 	if err != nil {
 		return nil, err
 	}
-	if row.TextHash == "" {
-		row.TextHash = hashText(row.Text)
+
+	if row == nil {
+		return nil, nil
 	}
-	return &row, nil
+
+	if row.TextHash == "" {
+		row.TextHash = text.HashSHA256Hex(row.Text)
+	}
+
+	return row, nil
 }
 
-func (p *Processor) getSentiment(ctx context.Context, row *commentRow) (string, error) {
-	cacheKey := "sentiment:text:" + row.TextHash
+func (p *Processor) fetchSentiment(ctx context.Context, row *repository.CommentProcessing) (string, error) {
+	cacheKey := sentimentCachePrefx + row.TextHash
 	label, err := p.Redis.Get(ctx, cacheKey).Result()
 	if err == nil && label != "" {
 		return label, nil
@@ -197,63 +194,27 @@ func (p *Processor) getSentiment(ctx context.Context, row *commentRow) (string, 
 	return resp.Label, nil
 }
 
-func (p *Processor) handleSuccess(ctx context.Context, commentID, label string) error {
+func (p *Processor) markSuccess(ctx context.Context, commentID, label string) error {
 	processedAt := time.Now().UTC()
 
 	payload, err := p.buildProcessedPayload(ctx, commentID, label, processedAt)
 	if err != nil {
 		return err
 	}
-
-	tx, err := p.DB.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		_ = tx.Rollback(ctx)
-	}()
-
-	_, err = tx.Exec(ctx, `
-UPDATE comments
-SET sentiment = $1,
-    status = 'processed',
-    processed_at = $2,
-    last_error = NULL,
-    updated_at = NOW()
-WHERE comment_id = $3
-`, label, processedAt, commentID)
-	if err != nil {
-		return err
-	}
-
-	_, err = tx.Exec(ctx, `
-INSERT INTO outbox_processed (comment_id, payload_json)
-VALUES ($1, $2)
-`, commentID, payload)
-	if err != nil {
-		return err
-	}
-
-	return tx.Commit(ctx)
+	return p.Repo.MarkCommentProcessed(ctx, commentID, label, processedAt, payload)
 }
 
 func (p *Processor) buildProcessedPayload(ctx context.Context, commentID, label string, processedAt time.Time) ([]byte, error) {
-	var eventID, text string
-	var eventTime time.Time
-	const query = `
-SELECT event_id, event_time, text
-FROM comments
-WHERE comment_id = $1
-`
-	if err := p.DB.QueryRow(ctx, query, commentID).Scan(&eventID, &eventTime, &text); err != nil {
+	payloadRow, err := p.Repo.LoadCommentPayload(ctx, commentID)
+	if err != nil {
 		return nil, err
 	}
 
 	payload := processedPayload{
 		CommentID:   commentID,
-		EventID:     eventID,
-		EventTime:   eventTime.UTC().Format(time.RFC3339Nano),
-		Text:        text,
+		EventID:     payloadRow.EventID,
+		EventTime:   payloadRow.EventTime.UTC().Format(time.RFC3339Nano),
+		Text:        payloadRow.Text,
 		Sentiment:   label,
 		ProcessedAt: processedAt.UTC().Format(time.RFC3339Nano),
 	}
@@ -261,28 +222,20 @@ WHERE comment_id = $1
 	return json.Marshal(payload)
 }
 
-func (p *Processor) handleFailure(ctx context.Context, commentID string, attemptCount int, err error) error {
+func (p *Processor) markFailure(ctx context.Context, commentID string, attemptCount int, err error) error {
 	attemptCount++
 	lastErr := err.Error()
 
-	status := "pending"
+	status := statusPending
 	if attemptCount >= p.Config.MaxAttempts {
-		status = "failed"
+		status = statusFailed
 	}
 
-	_, updateErr := p.DB.Exec(ctx, `
-UPDATE comments
-SET attempt_count = $1,
-    last_error = $2,
-    status = $3,
-    updated_at = NOW()
-WHERE comment_id = $4
-`, attemptCount, lastErr, status, commentID)
-	if updateErr != nil {
+	if updateErr := p.Repo.MarkCommentFailure(ctx, commentID, attemptCount, lastErr, status); updateErr != nil {
 		return updateErr
 	}
 
-	if status == "failed" {
+	if status == statusFailed {
 		return nil
 	}
 
@@ -313,11 +266,6 @@ func isRetryableRPC(err error) bool {
 	default:
 		return false
 	}
-}
-
-func hashText(text string) string {
-	h := sha256.Sum256([]byte(text))
-	return hex.EncodeToString(h[:])
 }
 
 const retryLua = `

@@ -8,6 +8,7 @@ import (
 
 	"comment-processing-service/internal/config"
 	"comment-processing-service/internal/db"
+	"comment-processing-service/internal/repository"
 	"comment-processing-service/internal/worker"
 	"comment-processing-service/proto/sentimentpb"
 
@@ -78,7 +79,8 @@ func main() {
 		RPCTimeout:      rpcTimeout,
 	}
 
-	proc := worker.NewProcessor(pool, redisClient, client, cfg, workerID)
+	repo := repository.NewRepository(pool)
+	proc := worker.NewProcessor(repo, redisClient, client, cfg, workerID)
 	log.Printf("worker started id=%s grpc=%s", workerID, grpcAddr)
 
 	if err := proc.Run(ctx); err != nil {
