@@ -2,33 +2,44 @@ package ingest
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"log"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/redis/go-redis/v9"
 	"github.com/segmentio/kafka-go"
+
+	"comment-processing-service/internal/cache"
+	"comment-processing-service/internal/model"
+	"comment-processing-service/internal/repository"
+	"comment-processing-service/internal/text"
 )
 
 type Config struct {
 	IdempotencyTTL time.Duration
 }
 
-type rawComment struct {
-	EventID   string `json:"event_id"`
-	EventTime string `json:"event_time"`
-	CommentID string `json:"comment_id"`
-	Text      string `json:"text"`
+type Service struct {
+	reader *kafka.Reader
+	repo   repository.Repository
+	cache  cache.Cache
+	cfg    Config
+}
+
+// NewService builds an ingest service with dependencies.
+func NewService(reader *kafka.Reader, repo repository.Repository, cacheClient cache.Cache, cfg Config) *Service {
+	return &Service{
+		reader: reader,
+		repo:   repo,
+		cache:  cacheClient,
+		cfg:    cfg,
+	}
 }
 
 // Run consumes Kafka messages, stores comments, and enqueues retries.
-func Run(ctx context.Context, reader *kafka.Reader, pool *pgxpool.Pool, redisClient *redis.Client, cfg Config) error {
+func (s *Service) Run(ctx context.Context) error {
 	for {
-		msg, err := reader.FetchMessage(ctx)
+		msg, err := s.reader.FetchMessage(ctx)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				return err
@@ -37,19 +48,19 @@ func Run(ctx context.Context, reader *kafka.Reader, pool *pgxpool.Pool, redisCli
 			continue
 		}
 
-		if err := handleMessage(ctx, pool, redisClient, msg, cfg.IdempotencyTTL); err != nil {
+		if err := s.handleMessage(ctx, msg); err != nil {
 			log.Printf("handle error: %v", err)
 			continue
 		}
 
-		if err := reader.CommitMessages(ctx, msg); err != nil {
+		if err := s.reader.CommitMessages(ctx, msg); err != nil {
 			log.Printf("commit error: %v", err)
 		}
 	}
 }
 
-func handleMessage(ctx context.Context, pool *pgxpool.Pool, redisClient *redis.Client, msg kafka.Message, ttl time.Duration) error {
-	var payload rawComment
+func (s *Service) handleMessage(ctx context.Context, msg kafka.Message) error {
+	var payload model.RawComment
 	if err := json.Unmarshal(msg.Value, &payload); err != nil {
 		log.Printf("invalid json: %v", err)
 		return nil
@@ -66,8 +77,8 @@ func handleMessage(ctx context.Context, pool *pgxpool.Pool, redisClient *redis.C
 		return nil
 	}
 
-	idempotencyKey := "processed:event:" + payload.EventID
-	set, err := redisClient.SetNX(ctx, idempotencyKey, "1", ttl).Result()
+	eventID := payload.EventID
+	set, err := s.cache.CheckAndMarkEvent(ctx, eventID, s.cfg.IdempotencyTTL)
 	if err != nil {
 		return err
 	}
@@ -76,11 +87,17 @@ func handleMessage(ctx context.Context, pool *pgxpool.Pool, redisClient *redis.C
 		return nil
 	}
 
-	textHash := hashText(payload.Text)
+	textHash := text.HashSHA256Hex(payload.Text)
 
-	upserted, err := upsertComment(ctx, pool, payload, eventTime, textHash)
+	upserted, err := s.repo.UpsertComment(ctx, repository.UpsertCommentParams{
+		CommentID: payload.CommentID,
+		EventID:   payload.EventID,
+		EventTime: eventTime,
+		Text:      payload.Text,
+		TextHash:  textHash,
+	})
 	if err != nil {
-		_ = redisClient.Del(ctx, idempotencyKey).Err()
+		_ = s.cache.UnmarkEvent(ctx, eventID)
 		return err
 	}
 
@@ -90,7 +107,7 @@ func handleMessage(ctx context.Context, pool *pgxpool.Pool, redisClient *redis.C
 	}
 
 	for {
-		if err := enqueueRetry(ctx, redisClient, payload.CommentID); err != nil {
+		if err := s.cache.EnqueueRetry(ctx, payload.CommentID); err != nil {
 			log.Printf("enqueue error comment_id=%s: %v", payload.CommentID, err)
 			select {
 			case <-ctx.Done():
@@ -104,39 +121,4 @@ func handleMessage(ctx context.Context, pool *pgxpool.Pool, redisClient *redis.C
 
 	log.Printf("ingested event_id=%s comment_id=%s text_hash=%s", payload.EventID, payload.CommentID, textHash)
 	return nil
-}
-
-func upsertComment(ctx context.Context, pool *pgxpool.Pool, payload rawComment, eventTime time.Time, textHash string) (bool, error) {
-	cmd, err := pool.Exec(ctx, `
-INSERT INTO comments (comment_id, event_id, event_time, text, text_hash, status, attempt_count, created_at, updated_at)
-VALUES ($1, $2, $3, $4, $5, 'pending', 0, NOW(), NOW())
-ON CONFLICT (comment_id) DO UPDATE SET
-  event_id = EXCLUDED.event_id,
-  event_time = EXCLUDED.event_time,
-  text = EXCLUDED.text,
-  text_hash = EXCLUDED.text_hash,
-  status = 'pending',
-  attempt_count = 0,
-  last_error = NULL,
-  processed_at = NULL,
-  updated_at = NOW()
-WHERE EXCLUDED.event_time > comments.event_time
-`, payload.CommentID, payload.EventID, eventTime, payload.Text, textHash)
-	if err != nil {
-		return false, err
-	}
-	return cmd.RowsAffected() > 0, nil
-}
-
-func enqueueRetry(ctx context.Context, client *redis.Client, commentID string) error {
-	score := float64(time.Now().UnixMilli())
-	return client.ZAdd(ctx, "retry:zset", redis.Z{
-		Score:  score,
-		Member: commentID,
-	}).Err()
-}
-
-func hashText(text string) string {
-	h := sha256.Sum256([]byte(text))
-	return hex.EncodeToString(h[:])
 }

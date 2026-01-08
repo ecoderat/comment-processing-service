@@ -10,6 +10,7 @@ import (
 	"comment-processing-service/internal/db"
 	kafkautil "comment-processing-service/internal/kafka"
 	"comment-processing-service/internal/outbox"
+	"comment-processing-service/internal/repository"
 
 	"github.com/segmentio/kafka-go"
 )
@@ -34,6 +35,8 @@ func main() {
 	}
 	defer pool.Close()
 
+	repo := repository.NewOutboxRepository(pool)
+
 	brokerList := strings.Split(brokers, ",")
 	if err := kafkautil.EnsureTopics(brokerList, []string{defaultTopic}); err != nil {
 		log.Fatalf("ensure topic: %v", err)
@@ -52,7 +55,8 @@ func main() {
 		BatchSize:    batchSize,
 		LoopInterval: loopInterval,
 	}
-	if err := outbox.Run(ctx, pool, writer, cfg); err != nil {
+	service := outbox.NewService(repo, writer, cfg)
+	if err := service.Run(ctx); err != nil {
 		log.Fatalf("outbox stopped: %v", err)
 	}
 }

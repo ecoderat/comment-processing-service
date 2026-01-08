@@ -45,7 +45,8 @@ func main() {
 		Seed:          seed,
 	}
 
-	if err := producer.Run(ctx, cfg); err != nil {
+	service := producer.NewService(cfg)
+	if err := service.Run(ctx); err != nil {
 		log.Fatalf("producer stopped: %v", err)
 	}
 }

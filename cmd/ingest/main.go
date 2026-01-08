@@ -7,11 +7,12 @@ import (
 	"strings"
 	"time"
 
+	"comment-processing-service/internal/cache"
 	"comment-processing-service/internal/config"
 	"comment-processing-service/internal/db"
 	"comment-processing-service/internal/ingest"
 	kafkautil "comment-processing-service/internal/kafka"
-	"comment-processing-service/internal/redis"
+	"comment-processing-service/internal/repository"
 
 	kafka "github.com/segmentio/kafka-go"
 )
@@ -41,9 +42,9 @@ func main() {
 	}
 	defer pool.Close()
 
-	redisClient := redis.NewClient(redisAddr, redisPassword, redisDB)
+	cacheClient := cache.NewWithPassword(redisAddr, redisPassword, redisDB)
 	defer func() {
-		_ = redisClient.Close()
+		_ = cacheClient.Close()
 	}()
 
 	brokerList := strings.Split(brokers, ",")
@@ -65,7 +66,9 @@ func main() {
 
 	log.Printf("ingest started topic=%s brokers=%s group=%s", topic, brokers, groupID)
 
-	if err := ingest.Run(ctx, reader, pool, redisClient, ingest.Config{IdempotencyTTL: idempotencyTTL}); err != nil {
+	repo := repository.NewRepository(pool)
+	service := ingest.NewService(reader, repo, cacheClient, ingest.Config{IdempotencyTTL: idempotencyTTL})
+	if err := service.Run(ctx); err != nil {
 		log.Fatalf("ingest stopped: %v", err)
 	}
 }

@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/segmentio/kafka-go"
+
+	"comment-processing-service/internal/model"
 )
 
 type Config struct {
@@ -27,27 +29,37 @@ type Config struct {
 	Seed          int64
 }
 
-type rawComment struct {
-	EventID   string `json:"event_id"`
-	EventTime string `json:"event_time"`
-	CommentID string `json:"comment_id"`
-	Text      string `json:"text"`
+type Service interface {
+	Run(ctx context.Context) error
 }
 
-// Run emits raw comments to Kafka until the context is cancelled.
-func Run(ctx context.Context, cfg Config) error {
-	rng := rand.New(rand.NewSource(cfg.Seed))
+type service struct {
+	cfg    Config
+	writer *kafka.Writer
+	rng    *rand.Rand
+}
 
+// NewService builds a producer service with its writer and RNG.
+func NewService(cfg Config) Service {
 	writer := kafka.NewWriter(kafka.WriterConfig{
 		Brokers:  cfg.Brokers,
 		Topic:    cfg.Topic,
 		Balancer: &kafka.Hash{},
 	})
+	return &service{
+		cfg:    cfg,
+		writer: writer,
+		rng:    rand.New(rand.NewSource(cfg.Seed)),
+	}
+}
+
+// Run emits raw comments to Kafka until the context is cancelled.
+func (s *service) Run(ctx context.Context) error {
 	defer func() {
-		_ = writer.Close()
+		_ = s.writer.Close()
 	}()
 
-	log.Printf("producer started topic=%s brokers=%s", cfg.Topic, strings.Join(cfg.Brokers, ","))
+	log.Printf("producer started topic=%s brokers=%s", s.cfg.Topic, strings.Join(s.cfg.Brokers, ","))
 
 	var recentTexts []string
 	burstRemaining := 0
@@ -59,15 +71,15 @@ func Run(ctx context.Context, cfg Config) error {
 		default:
 		}
 
-		if burstRemaining == 0 && rng.Intn(100) < clampPercent(cfg.BurstPercent) {
-			burstRemaining = cfg.BurstCount
+		if burstRemaining == 0 && s.rng.Intn(100) < clampPercent(s.cfg.BurstPercent) {
+			burstRemaining = s.cfg.BurstCount
 		}
 
-		text := generateText(rng, cfg.Size, &recentTexts, clampPercent(cfg.ReusePercent))
-		msg := rawComment{
+		text := generateText(s.rng, s.cfg.Size, &recentTexts, clampPercent(s.cfg.ReusePercent))
+		msg := model.RawComment{
 			EventID:   newUUID(),
 			EventTime: time.Now().UTC().Format(time.RFC3339Nano),
-			CommentID: randomID(rng, 12),
+			CommentID: randomID(s.rng, 12),
 			Text:      text,
 		}
 
@@ -82,7 +94,7 @@ func Run(ctx context.Context, cfg Config) error {
 			Value: payload,
 		}
 
-		if err := writer.WriteMessages(ctx, kmsg); err != nil {
+		if err := s.writer.WriteMessages(ctx, kmsg); err != nil {
 			log.Printf("kafka write error: %v", err)
 		} else {
 			log.Printf("sent comment_id=%s event_id=%s size=%d", msg.CommentID, msg.EventID, len(msg.Text))
@@ -90,11 +102,11 @@ func Run(ctx context.Context, cfg Config) error {
 
 		if burstRemaining > 0 {
 			burstRemaining--
-			sleepWithJitter(rng, cfg.BurstInterval)
+			sleepWithJitter(s.rng, s.cfg.BurstInterval)
 			continue
 		}
 
-		sleepWithJitter(rng, cfg.Interval)
+		sleepWithJitter(s.rng, s.cfg.Interval)
 	}
 }
 

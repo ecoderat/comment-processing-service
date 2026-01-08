@@ -4,6 +4,8 @@ import (
 	"os"
 	"strconv"
 	"time"
+
+	"github.com/joho/godotenv"
 )
 
 // GetEnv returns env value or default if empty.
@@ -32,4 +34,9 @@ func GetEnvDuration(key string, fallback time.Duration) time.Duration {
 		}
 	}
 	return fallback
+}
+
+// LoadEnv loads .env if present; missing file is ignored.
+func LoadEnv() {
+	_ = godotenv.Load()
 }

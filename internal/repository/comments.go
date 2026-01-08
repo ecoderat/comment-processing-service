@@ -27,10 +27,19 @@ type ListParams struct {
 	Offset    int
 }
 
+type UpsertCommentParams struct {
+	CommentID string
+	EventID   string
+	EventTime time.Time
+	Text      string
+	TextHash  string
+}
+
 // Repository defines the methods for interacting with the data store.
 type Repository interface {
 	ListComments(ctx context.Context, params ListParams) ([]Comment, error)
 	GetComment(ctx context.Context, commentID string) (Comment, error)
+	UpsertComment(ctx context.Context, params UpsertCommentParams) (bool, error)
 }
 
 type repository struct {
@@ -39,6 +48,11 @@ type repository struct {
 
 // NewRepository creates a new Repository instance.
 func NewRepository(pool *pgxpool.Pool) Repository {
+	return &repository{pool: pool}
+}
+
+// NewOutboxRepository creates a repository for outbox operations.
+func NewOutboxRepository(pool *pgxpool.Pool) OutboxRepository {
 	return &repository{pool: pool}
 }
 
@@ -119,4 +133,27 @@ WHERE comment_id = $1
 	}
 
 	return comment, nil
+}
+
+// UpsertComment inserts or updates a comment if the event_time is newer.
+func (r *repository) UpsertComment(ctx context.Context, params UpsertCommentParams) (bool, error) {
+	cmd, err := r.pool.Exec(ctx, `
+INSERT INTO comments (comment_id, event_id, event_time, text, text_hash, status, attempt_count, created_at, updated_at)
+VALUES ($1, $2, $3, $4, $5, 'pending', 0, NOW(), NOW())
+ON CONFLICT (comment_id) DO UPDATE SET
+  event_id = EXCLUDED.event_id,
+  event_time = EXCLUDED.event_time,
+  text = EXCLUDED.text,
+  text_hash = EXCLUDED.text_hash,
+  status = 'pending',
+  attempt_count = 0,
+  last_error = NULL,
+  processed_at = NULL,
+  updated_at = NOW()
+WHERE EXCLUDED.event_time > comments.event_time
+`, params.CommentID, params.EventID, params.EventTime, params.Text, params.TextHash)
+	if err != nil {
+		return false, err
+	}
+	return cmd.RowsAffected() > 0, nil
 }

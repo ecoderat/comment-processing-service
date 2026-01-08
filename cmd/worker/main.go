@@ -8,9 +8,10 @@ import (
 
 	"comment-processing-service/internal/config"
 	"comment-processing-service/internal/db"
-	"comment-processing-service/internal/redis"
 	"comment-processing-service/internal/worker"
 	"comment-processing-service/proto/sentimentpb"
+
+	"github.com/redis/go-redis/v9"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -49,7 +50,12 @@ func main() {
 	}
 	defer pool.Close()
 
-	redisClient := redis.NewClient(redisAddr, redisPassword, redisDB)
+	// NewClient returns a go-redis client with the provided options.
+	redisClient := redis.NewClient(&redis.Options{
+		Addr:     redisAddr,
+		Password: redisPassword,
+		DB:       redisDB,
+	})
 	defer func() { _ = redisClient.Close() }()
 
 	conn, err := grpc.Dial(grpcAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
