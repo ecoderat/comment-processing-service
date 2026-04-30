@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"comment-processing-service/internal/config"
@@ -21,7 +24,8 @@ import (
 func main() {
 	config.LoadEnv()
 
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	dsn := config.GetEnv("DATABASE_URL", "")
 	if dsn == "" {
@@ -40,7 +44,7 @@ func main() {
 	maxBackoff := config.GetEnvDuration("BACKOFF_MAX", 30*time.Second)
 	jitter := config.GetEnvDuration("BACKOFF_JITTER", 200*time.Millisecond)
 	lockTTL := config.GetEnvDuration("LOCK_TTL", 30*time.Second)
-	retryZSet := config.GetEnv("RETRY_ZSET", "retry:zset")
+	shared := config.Load()
 	textCacheTTL := config.GetEnvDuration("TEXT_CACHE_TTL", 7*24*time.Hour)
 	rateLimit := config.GetEnvInt("RPC_RATE_LIMIT", 100)
 	rpcTimeout := config.GetEnvDuration("RPC_TIMEOUT", 2*time.Second)
@@ -59,7 +63,7 @@ func main() {
 	})
 	defer func() { _ = redisClient.Close() }()
 
-	conn, err := grpc.Dial(grpcAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(grpcAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		logrus.StandardLogger().WithError(err).Fatal("grpc dial")
 	}
@@ -73,7 +77,7 @@ func main() {
 		MaxBackoff:      maxBackoff,
 		Jitter:          jitter,
 		LockTTL:         lockTTL,
-		RetryZSet:       retryZSet,
+		RetryZSet:       shared.RetryZSet,
 		TextCacheTTL:    textCacheTTL,
 		RateLimitPerSec: rateLimit,
 		RPCTimeout:      rpcTimeout,
@@ -86,7 +90,7 @@ func main() {
 		"grpc":      grpcAddr,
 	}).Info("worker started")
 
-	if err := proc.Run(ctx); err != nil {
+	if err := proc.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		logrus.StandardLogger().WithError(err).Fatal("worker stopped")
 	}
 }

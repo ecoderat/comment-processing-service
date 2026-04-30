@@ -54,6 +54,30 @@ type Processor struct {
 	Logger   *logrus.Logger
 }
 
+// nonRetryableError marks an error that should not be re-scheduled.
+// The worker terminates the comment as failed instead of incrementing
+// attempt_count and pushing it back onto the retry ZSET.
+type nonRetryableError struct{ err error }
+
+func (e *nonRetryableError) Error() string { return e.err.Error() }
+func (e *nonRetryableError) Unwrap() error { return e.err }
+
+func isNonRetryable(err error) bool {
+	var nre *nonRetryableError
+	return errors.As(err, &nre)
+}
+
+// releaseLockScript releases a SETNX lock only if the caller still owns it
+// (the stored value matches the worker's token). Without this guard, a
+// deferred plain DEL would delete another worker's lock if our TTL expired
+// during a slow RPC.
+var releaseLockScript = redisv9.NewScript(`
+    if redis.call("GET", KEYS[1]) == ARGV[1] then
+        return redis.call("DEL", KEYS[1])
+    end
+    return 0
+`)
+
 type processedPayload struct {
 	CommentID   string `json:"comment_id"`
 	EventID     string `json:"event_id"`
@@ -131,10 +155,22 @@ func (p *Processor) process(ctx context.Context, commentID string) error {
 		return err
 	}
 	if !locked {
+		nextAttempt := float64(time.Now().Add(p.Config.LockTTL).UnixMilli())
+		if err := p.Redis.ZAdd(ctx, p.Config.RetryZSet, redisv9.Z{
+			Score:  nextAttempt,
+			Member: commentID,
+		}).Err(); err != nil {
+			p.Logger.WithError(err).WithField("comment_id", commentID).Error("re-enqueue after lock contention failed")
+			return err
+		}
 		return nil
 	}
 	defer func() {
-		_, _ = p.Redis.Del(ctx, lockKey).Result()
+		releaseCtx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		defer cancel()
+		if err := releaseLockScript.Run(releaseCtx, p.Redis, []string{lockKey}, p.WorkerID).Err(); err != nil && !errors.Is(err, redisv9.Nil) {
+			p.Logger.WithError(err).WithField("comment_id", commentID).Warn("lock release failed")
+		}
 	}()
 
 	row, err := p.loadForProcessing(ctx, commentID)
@@ -199,10 +235,10 @@ func (p *Processor) fetchSentiment(ctx context.Context, row *repository.CommentP
 
 	resp, err := p.RPC.Analyze(rpcCtx, &sentimentpb.AnalyzeRequest{Text: row.Text})
 	if err != nil {
-		if isRetryableRPC(err) {
-			return "", err
+		if !isRetryableRPC(err) {
+			return "", &nonRetryableError{err: fmt.Errorf("rpc analyze: %w", err)}
 		}
-		return "", fmt.Errorf("rpc analyze: %w", err)
+		return "", err
 	}
 
 	if err := p.Redis.Set(ctx, cacheKey, resp.Label, p.Config.TextCacheTTL).Err(); err != nil {
@@ -243,6 +279,17 @@ func (p *Processor) buildProcessedPayload(ctx context.Context, commentID, label 
 }
 
 func (p *Processor) markFailure(ctx context.Context, commentID string, attemptCount int, err error) error {
+	if isNonRetryable(err) {
+		if updateErr := p.Repo.MarkCommentFailed(ctx, commentID, err.Error()); updateErr != nil {
+			return fmt.Errorf("mark failed %s: %w", commentID, updateErr)
+		}
+		p.Logger.WithFields(logrus.Fields{
+			"comment_id": commentID,
+			"reason":     err.Error(),
+		}).Warn("comment marked failed (non-retryable)")
+		return nil
+	}
+
 	attemptCount++
 	lastErr := err.Error()
 

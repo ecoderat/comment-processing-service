@@ -9,13 +9,12 @@ import (
 
 const (
 	idemKeyPrefix = "idem:event:"
-	retryZSetKey  = "retry:zset"
 )
 
 type Cache interface {
 	CheckAndMarkEvent(ctx context.Context, eventID string, ttl time.Duration) (bool, error)
 	UnmarkEvent(ctx context.Context, eventID string) error
-	EnqueueRetry(ctx context.Context, commentID string) error
+	EnqueueRetry(ctx context.Context, key, commentID string) error
 	Close() error
 }
 
@@ -61,9 +60,11 @@ func (c *cache) UnmarkEvent(ctx context.Context, eventID string) error {
 }
 
 // EnqueueRetry adds a comment ID to the retry sorted set.
-func (c *cache) EnqueueRetry(ctx context.Context, commentID string) error {
+// Uses ZADD NX so an existing future-dated retry score is not clobbered by a
+// duplicate ingest (e.g. after Redis flush or idempotency TTL expiry).
+func (c *cache) EnqueueRetry(ctx context.Context, key, commentID string) error {
 	score := float64(time.Now().UnixMilli())
-	return c.rdb.ZAdd(ctx, retryZSetKey, redis.Z{
+	return c.rdb.ZAddNX(ctx, key, redis.Z{
 		Score:  score,
 		Member: commentID,
 	}).Err()

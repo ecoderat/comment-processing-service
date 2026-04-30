@@ -62,6 +62,7 @@ type Repository interface {
 	LoadCommentPayload(ctx context.Context, commentID string) (CommentPayload, error)
 	MarkCommentProcessed(ctx context.Context, commentID, label string, processedAt time.Time, payload []byte) error
 	MarkCommentFailure(ctx context.Context, commentID string, attemptCount int, lastErr string, status string) error
+	MarkCommentFailed(ctx context.Context, commentID, lastErr string) error
 }
 
 type repository struct {
@@ -236,6 +237,19 @@ VALUES ($1, $2)
 	}
 
 	return tx.Commit(ctx)
+}
+
+// MarkCommentFailed terminates a comment without touching attempt_count.
+// Used when the worker classifies an error as non-retryable.
+func (r *repository) MarkCommentFailed(ctx context.Context, commentID, lastErr string) error {
+	_, err := r.pool.Exec(ctx, `
+UPDATE comments
+SET status = 'failed',
+    last_error = $1,
+    updated_at = NOW()
+WHERE comment_id = $2
+`, lastErr, commentID)
+	return err
 }
 
 // MarkCommentFailure updates the comment with failure details.

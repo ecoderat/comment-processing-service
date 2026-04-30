@@ -2,8 +2,6 @@ package repository
 
 import (
 	"context"
-
-	"github.com/jackc/pgx/v5"
 )
 
 type OutboxRow struct {
@@ -64,8 +62,5 @@ SET publish_attempts = publish_attempts + 1,
     last_error = $2
 WHERE id = $1
 `, id, err.Error())
-	if execErr != nil && execErr != pgx.ErrNoRows {
-		return execErr
-	}
-	return nil
+	return execErr
 }

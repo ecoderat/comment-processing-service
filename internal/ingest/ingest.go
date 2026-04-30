@@ -17,6 +17,7 @@ import (
 
 type Config struct {
 	IdempotencyTTL time.Duration
+	RetryZSet      string
 }
 
 type Service struct {
@@ -130,7 +131,7 @@ func (s *Service) handleMessage(ctx context.Context, msg kafka.Message) error {
 	}
 
 	for {
-		if err := s.cache.EnqueueRetry(ctx, payload.CommentID); err != nil {
+		if err := s.cache.EnqueueRetry(ctx, s.cfg.RetryZSet, payload.CommentID); err != nil {
 			s.logger.WithError(err).WithField("comment_id", payload.CommentID).Error("enqueue retry error")
 			select {
 			case <-ctx.Done():

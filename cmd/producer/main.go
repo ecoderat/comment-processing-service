@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"comment-processing-service/internal/config"
@@ -28,7 +31,9 @@ func main() {
 	burstCount := config.GetEnvInt("PRODUCER_BURST_COUNT", 20)
 	seed := time.Now().UnixNano()
 
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	brokerList := strings.Split(brokers, ",")
 	if err := kafkautil.EnsureTopics(brokerList, []string{topic}); err != nil {
 		logrus.StandardLogger().WithError(err).Fatal("ensure topic")
@@ -47,7 +52,7 @@ func main() {
 	}
 
 	service := producer.NewService(cfg, logrus.StandardLogger())
-	if err := service.Run(ctx); err != nil {
+	if err := service.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		logrus.StandardLogger().WithError(err).Fatal("producer stopped")
 	}
 }
