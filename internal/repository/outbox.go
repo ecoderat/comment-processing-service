@@ -19,7 +19,7 @@ type OutboxRepository interface {
 }
 
 // FetchOutboxBatch returns unpublished outbox rows up to limit.
-func (r *repository) FetchOutboxBatch(ctx context.Context, limit int) ([]OutboxRow, error) {
+func (r *Repository) FetchOutboxBatch(ctx context.Context, limit int) ([]OutboxRow, error) {
 	const query = `
 SELECT id, comment_id, payload_json, topic
 FROM outbox_processed
@@ -45,7 +45,7 @@ LIMIT $1
 }
 
 // MarkOutboxPublished marks an outbox row as published.
-func (r *repository) MarkOutboxPublished(ctx context.Context, id int64) error {
+func (r *Repository) MarkOutboxPublished(ctx context.Context, id int64) error {
 	_, err := r.pool.Exec(ctx, `
 UPDATE outbox_processed
 SET published_at = NOW()
@@ -55,7 +55,7 @@ WHERE id = $1
 }
 
 // MarkOutboxPublishError updates publish attempts and last error.
-func (r *repository) MarkOutboxPublishError(ctx context.Context, id int64, err error) error {
+func (r *Repository) MarkOutboxPublishError(ctx context.Context, id int64, err error) error {
 	_, execErr := r.pool.Exec(ctx, `
 UPDATE outbox_processed
 SET publish_attempts = publish_attempts + 1,

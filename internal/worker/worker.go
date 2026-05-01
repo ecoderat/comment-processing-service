@@ -38,20 +38,29 @@ const (
 	statusFailed    = "failed"
 
 	lockKeyPrefix       = "lock:comment:"
-	sentimentCachePrefx = "sentiment:text:"
+	sentimentCachePrefix = "sentiment:text:"
 	pollSleep           = 200 * time.Millisecond
 )
 
+// WorkerRepo is the slice of the repository this worker depends on.
+type WorkerRepo interface {
+	LoadCommentForProcessing(ctx context.Context, commentID string) (*repository.CommentProcessing, error)
+	LoadCommentPayload(ctx context.Context, commentID string) (repository.CommentPayload, error)
+	MarkCommentProcessed(ctx context.Context, commentID, label string, processedAt time.Time, payload []byte) error
+	RecordRetryableFailure(ctx context.Context, commentID string, attemptCount int, lastErr string, status string) error
+	MarkAsTerminallyFailed(ctx context.Context, commentID, lastErr string) error
+}
+
 type Processor struct {
-	Repo     repository.Repository
-	Redis    *redisv9.Client
-	Limiter  *rate.Limiter
-	RPC      sentimentpb.SentimentServiceClient
-	RetryLua *redisv9.Script
-	Config   Config
-	WorkerID string
-	Rand     *rand.Rand
-	Logger   *logrus.Logger
+	repo     WorkerRepo
+	redis    *redisv9.Client
+	limiter  *rate.Limiter
+	rpc      sentimentpb.SentimentServiceClient
+	retryLua *redisv9.Script
+	config   Config
+	workerID string
+	rand     *rand.Rand
+	logger   *logrus.Logger
 }
 
 // nonRetryableError marks an error that should not be re-scheduled.
@@ -79,36 +88,36 @@ var releaseLockScript = redisv9.NewScript(`
 `)
 
 type processedPayload struct {
-	CommentID   string `json:"comment_id"`
-	EventID     string `json:"event_id"`
-	EventTime   string `json:"event_time"`
-	Text        string `json:"text"`
-	Sentiment   string `json:"sentiment"`
-	ProcessedAt string `json:"processed_at"`
+	CommentID   string    `json:"comment_id"`
+	EventID     string    `json:"event_id"`
+	EventTime   time.Time `json:"event_time"`
+	Text        string    `json:"text"`
+	Sentiment   string    `json:"sentiment"`
+	ProcessedAt time.Time `json:"processed_at"`
 }
 
-func NewProcessor(repo repository.Repository, redis *redisv9.Client, rpc sentimentpb.SentimentServiceClient, cfg Config, workerID string, logger *logrus.Logger) *Processor {
+func NewProcessor(repo WorkerRepo, redis *redisv9.Client, rpc sentimentpb.SentimentServiceClient, cfg Config, workerID string, logger *logrus.Logger) *Processor {
 	if logger == nil {
 		logger = logrus.StandardLogger()
 	}
 	limiter := rate.NewLimiter(rate.Limit(cfg.RateLimitPerSec), cfg.RateLimitPerSec)
 	return &Processor{
-		Repo:     repo,
-		Redis:    redis,
-		Limiter:  limiter,
-		RPC:      rpc,
-		RetryLua: redisv9.NewScript(retryLua),
-		Config:   cfg,
-		WorkerID: workerID,
-		Rand:     rand.New(rand.NewSource(time.Now().UnixNano())),
-		Logger:   logger,
+		repo:     repo,
+		redis:    redis,
+		limiter:  limiter,
+		rpc:      rpc,
+		retryLua: redisv9.NewScript(retryLua),
+		config:   cfg,
+		workerID: workerID,
+		rand:     rand.New(rand.NewSource(time.Now().UnixNano())),
+		logger:   logger,
 	}
 }
 
 func (p *Processor) Run(ctx context.Context) error {
-	p.Logger.WithFields(logrus.Fields{
-		"worker_id":  p.WorkerID,
-		"retry_zset": p.Config.RetryZSet,
+	p.logger.WithFields(logrus.Fields{
+		"worker_id":  p.workerID,
+		"retry_zset": p.config.RetryZSet,
 	}).Info("worker started")
 	for {
 		select {
@@ -131,14 +140,14 @@ func (p *Processor) Run(ctx context.Context) error {
 		}
 
 		if err := p.process(ctx, commentID); err != nil {
-			p.Logger.WithError(err).WithField("comment_id", commentID).Error("worker process error")
+			p.logger.WithError(err).WithField("comment_id", commentID).Error("worker process error")
 			continue
 		}
 	}
 }
 
 func (p *Processor) dequeueDue(ctx context.Context) (string, error) {
-	res, err := p.RetryLua.Run(ctx, p.Redis, []string{p.Config.RetryZSet}, time.Now().UnixMilli()).Result()
+	res, err := p.retryLua.Run(ctx, p.redis, []string{p.config.RetryZSet}, time.Now().UnixMilli()).Result()
 	if err != nil {
 		return "", err
 	}
@@ -150,17 +159,17 @@ func (p *Processor) dequeueDue(ctx context.Context) (string, error) {
 
 func (p *Processor) process(ctx context.Context, commentID string) error {
 	lockKey := lockKeyPrefix + commentID
-	locked, err := p.Redis.SetNX(ctx, lockKey, p.WorkerID, p.Config.LockTTL).Result()
+	locked, err := p.redis.SetNX(ctx, lockKey, p.workerID, p.config.LockTTL).Result()
 	if err != nil {
 		return err
 	}
 	if !locked {
-		nextAttempt := float64(time.Now().Add(p.Config.LockTTL).UnixMilli())
-		if err := p.Redis.ZAdd(ctx, p.Config.RetryZSet, redisv9.Z{
+		nextAttempt := float64(time.Now().Add(p.config.LockTTL).UnixMilli())
+		if err := p.redis.ZAdd(ctx, p.config.RetryZSet, redisv9.Z{
 			Score:  nextAttempt,
 			Member: commentID,
 		}).Err(); err != nil {
-			p.Logger.WithError(err).WithField("comment_id", commentID).Error("re-enqueue after lock contention failed")
+			p.logger.WithError(err).WithField("comment_id", commentID).Error("re-enqueue after lock contention failed")
 			return err
 		}
 		return nil
@@ -168,8 +177,8 @@ func (p *Processor) process(ctx context.Context, commentID string) error {
 	defer func() {
 		releaseCtx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 		defer cancel()
-		if err := releaseLockScript.Run(releaseCtx, p.Redis, []string{lockKey}, p.WorkerID).Err(); err != nil && !errors.Is(err, redisv9.Nil) {
-			p.Logger.WithError(err).WithField("comment_id", commentID).Warn("lock release failed")
+		if err := releaseLockScript.Run(releaseCtx, p.redis, []string{lockKey}, p.workerID).Err(); err != nil && !errors.Is(err, redisv9.Nil) {
+			p.logger.WithError(err).WithField("comment_id", commentID).Warn("lock release failed")
 		}
 	}()
 
@@ -192,7 +201,7 @@ func (p *Processor) process(ctx context.Context, commentID string) error {
 	if err := p.markSuccess(ctx, commentID, label); err != nil {
 		return err
 	}
-	p.Logger.WithFields(logrus.Fields{
+	p.logger.WithFields(logrus.Fields{
 		"comment_id": commentID,
 		"label":      label,
 	}).Info("comment processed")
@@ -200,7 +209,7 @@ func (p *Processor) process(ctx context.Context, commentID string) error {
 }
 
 func (p *Processor) loadForProcessing(ctx context.Context, commentID string) (*repository.CommentProcessing, error) {
-	row, err := p.Repo.LoadCommentForProcessing(ctx, commentID)
+	row, err := p.repo.LoadCommentForProcessing(ctx, commentID)
 	if err != nil {
 		return nil, fmt.Errorf("load comment %s: %w", commentID, err)
 	}
@@ -217,8 +226,8 @@ func (p *Processor) loadForProcessing(ctx context.Context, commentID string) (*r
 }
 
 func (p *Processor) fetchSentiment(ctx context.Context, row *repository.CommentProcessing) (string, error) {
-	cacheKey := sentimentCachePrefx + row.TextHash
-	label, err := p.Redis.Get(ctx, cacheKey).Result()
+	cacheKey := sentimentCachePrefix + row.TextHash
+	label, err := p.redis.Get(ctx, cacheKey).Result()
 	if err == nil && label != "" {
 		return label, nil
 	}
@@ -226,14 +235,14 @@ func (p *Processor) fetchSentiment(ctx context.Context, row *repository.CommentP
 		return "", fmt.Errorf("cache get: %w", err)
 	}
 
-	if err := p.Limiter.Wait(ctx); err != nil {
+	if err := p.limiter.Wait(ctx); err != nil {
 		return "", fmt.Errorf("rate limit: %w", err)
 	}
 
-	rpcCtx, cancel := context.WithTimeout(ctx, p.Config.RPCTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, p.config.RPCTimeout)
 	defer cancel()
 
-	resp, err := p.RPC.Analyze(rpcCtx, &sentimentpb.AnalyzeRequest{Text: row.Text})
+	resp, err := p.rpc.Analyze(rpcCtx, &sentimentpb.AnalyzeRequest{Text: row.Text})
 	if err != nil {
 		if !isRetryableRPC(err) {
 			return "", &nonRetryableError{err: fmt.Errorf("rpc analyze: %w", err)}
@@ -241,7 +250,7 @@ func (p *Processor) fetchSentiment(ctx context.Context, row *repository.CommentP
 		return "", err
 	}
 
-	if err := p.Redis.Set(ctx, cacheKey, resp.Label, p.Config.TextCacheTTL).Err(); err != nil {
+	if err := p.redis.Set(ctx, cacheKey, resp.Label, p.config.TextCacheTTL).Err(); err != nil {
 		return "", fmt.Errorf("cache set: %w", err)
 	}
 	return resp.Label, nil
@@ -254,14 +263,14 @@ func (p *Processor) markSuccess(ctx context.Context, commentID, label string) er
 	if err != nil {
 		return fmt.Errorf("build payload %s: %w", commentID, err)
 	}
-	if err := p.Repo.MarkCommentProcessed(ctx, commentID, label, processedAt, payload); err != nil {
+	if err := p.repo.MarkCommentProcessed(ctx, commentID, label, processedAt, payload); err != nil {
 		return fmt.Errorf("mark processed %s: %w", commentID, err)
 	}
 	return nil
 }
 
 func (p *Processor) buildProcessedPayload(ctx context.Context, commentID, label string, processedAt time.Time) ([]byte, error) {
-	payloadRow, err := p.Repo.LoadCommentPayload(ctx, commentID)
+	payloadRow, err := p.repo.LoadCommentPayload(ctx, commentID)
 	if err != nil {
 		return nil, fmt.Errorf("load payload %s: %w", commentID, err)
 	}
@@ -269,10 +278,10 @@ func (p *Processor) buildProcessedPayload(ctx context.Context, commentID, label 
 	payload := processedPayload{
 		CommentID:   commentID,
 		EventID:     payloadRow.EventID,
-		EventTime:   payloadRow.EventTime.UTC().Format(time.RFC3339Nano),
+		EventTime:   payloadRow.EventTime.UTC(),
 		Text:        payloadRow.Text,
 		Sentiment:   label,
-		ProcessedAt: processedAt.UTC().Format(time.RFC3339Nano),
+		ProcessedAt: processedAt.UTC(),
 	}
 
 	return json.Marshal(payload)
@@ -280,10 +289,10 @@ func (p *Processor) buildProcessedPayload(ctx context.Context, commentID, label 
 
 func (p *Processor) markFailure(ctx context.Context, commentID string, attemptCount int, err error) error {
 	if isNonRetryable(err) {
-		if updateErr := p.Repo.MarkCommentFailed(ctx, commentID, err.Error()); updateErr != nil {
+		if updateErr := p.repo.MarkAsTerminallyFailed(ctx, commentID, err.Error()); updateErr != nil {
 			return fmt.Errorf("mark failed %s: %w", commentID, updateErr)
 		}
-		p.Logger.WithFields(logrus.Fields{
+		p.logger.WithFields(logrus.Fields{
 			"comment_id": commentID,
 			"reason":     err.Error(),
 		}).Warn("comment marked failed (non-retryable)")
@@ -294,16 +303,16 @@ func (p *Processor) markFailure(ctx context.Context, commentID string, attemptCo
 	lastErr := err.Error()
 
 	status := statusPending
-	if attemptCount >= p.Config.MaxAttempts {
+	if attemptCount >= p.config.MaxAttempts {
 		status = statusFailed
 	}
 
-	if updateErr := p.Repo.MarkCommentFailure(ctx, commentID, attemptCount, lastErr, status); updateErr != nil {
+	if updateErr := p.repo.RecordRetryableFailure(ctx, commentID, attemptCount, lastErr, status); updateErr != nil {
 		return fmt.Errorf("mark failure %s: %w", commentID, updateErr)
 	}
 
 	if status == statusFailed {
-		p.Logger.WithFields(logrus.Fields{
+		p.logger.WithFields(logrus.Fields{
 			"comment_id":    commentID,
 			"attempt_count": attemptCount,
 		}).Warn("comment marked failed")
@@ -311,23 +320,23 @@ func (p *Processor) markFailure(ctx context.Context, commentID string, attemptCo
 	}
 
 	nextAttempt := time.Now().Add(p.retryDelay(attemptCount))
-	p.Logger.WithFields(logrus.Fields{
+	p.logger.WithFields(logrus.Fields{
 		"comment_id":    commentID,
 		"attempt_count": attemptCount,
 		"next_attempt":  nextAttempt.UTC().Format(time.RFC3339Nano),
 	}).Info("comment retry scheduled")
-	return p.Redis.ZAdd(ctx, p.Config.RetryZSet, redisv9.Z{
+	return p.redis.ZAdd(ctx, p.config.RetryZSet, redisv9.Z{
 		Score:  float64(nextAttempt.UnixMilli()),
 		Member: commentID,
 	}).Err()
 }
 
 func (p *Processor) retryDelay(attempt int) time.Duration {
-	backoff := float64(p.Config.BaseBackoff) * math.Pow(2, float64(attempt-1))
-	if backoff > float64(p.Config.MaxBackoff) {
-		backoff = float64(p.Config.MaxBackoff)
+	backoff := float64(p.config.BaseBackoff) * math.Pow(2, float64(attempt-1))
+	if backoff > float64(p.config.MaxBackoff) {
+		backoff = float64(p.config.MaxBackoff)
 	}
-	jitter := time.Duration(p.Rand.Int63n(int64(p.Config.Jitter) + 1))
+	jitter := time.Duration(p.rand.Int63n(int64(p.config.Jitter) + 1))
 	return time.Duration(backoff) + jitter
 }
 
