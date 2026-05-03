@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"comment-processing-service/internal/cache"
@@ -20,7 +23,8 @@ import (
 func main() {
 	config.LoadEnv()
 
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	brokers := config.GetEnv("KAFKA_BROKERS", "127.0.0.1:9092")
 	topic := config.GetEnv("KAFKA_TOPIC", "raw-comments")
@@ -30,6 +34,7 @@ func main() {
 	redisPassword := os.Getenv("REDIS_PASSWORD")
 	redisDB := config.GetEnvInt("REDIS_DB", 0)
 	idempotencyTTL := config.GetEnvDuration("IDEMPOTENCY_TTL", 24*time.Hour)
+	shared := config.Load()
 
 	dsn := config.GetEnv("DATABASE_URL", "")
 	if dsn == "" {
@@ -71,8 +76,11 @@ func main() {
 	}).Info("ingest started")
 
 	repo := repository.NewRepository(pool)
-	service := ingest.NewService(reader, repo, cacheClient, ingest.Config{IdempotencyTTL: idempotencyTTL}, logrus.StandardLogger())
-	if err := service.Run(ctx); err != nil {
+	service := ingest.NewService(reader, repo, cacheClient, ingest.Config{
+		IdempotencyTTL: idempotencyTTL,
+		RetryZSet:      shared.RetryZSet,
+	}, logrus.StandardLogger())
+	if err := service.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		logrus.StandardLogger().WithError(err).Fatal("ingest stopped")
 	}
 }

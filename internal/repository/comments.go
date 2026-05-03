@@ -53,34 +53,26 @@ type UpsertCommentParams struct {
 	TextHash  string
 }
 
-// Repository defines the methods for interacting with the data store.
-type Repository interface {
-	ListComments(ctx context.Context, params ListParams) ([]Comment, error)
-	GetComment(ctx context.Context, commentID string) (Comment, error)
-	UpsertComment(ctx context.Context, params UpsertCommentParams) (bool, error)
-	LoadCommentForProcessing(ctx context.Context, commentID string) (*CommentProcessing, error)
-	LoadCommentPayload(ctx context.Context, commentID string) (CommentPayload, error)
-	MarkCommentProcessed(ctx context.Context, commentID, label string, processedAt time.Time, payload []byte) error
-	MarkCommentFailure(ctx context.Context, commentID string, attemptCount int, lastErr string, status string) error
-}
-
-type repository struct {
+// Repository is a Postgres-backed data store. Consumers should depend on
+// narrower role interfaces declared in their own packages rather than this
+// concrete type.
+type Repository struct {
 	pool *pgxpool.Pool
 }
 
 // NewRepository creates a new Repository instance.
-func NewRepository(pool *pgxpool.Pool) Repository {
-	return &repository{pool: pool}
+func NewRepository(pool *pgxpool.Pool) *Repository {
+	return &Repository{pool: pool}
 }
 
 // NewOutboxRepository creates a repository for outbox operations.
 func NewOutboxRepository(pool *pgxpool.Pool) OutboxRepository {
-	return &repository{pool: pool}
+	return &Repository{pool: pool}
 }
 
 // ListComments fetches comments using optional filters.
-func (r *repository) ListComments(ctx context.Context, params ListParams) ([]Comment, error) {
-	where := []string{"1=1"}
+func (r *Repository) ListComments(ctx context.Context, params ListParams) ([]Comment, error) {
+	where := []string{}
 	args := []interface{}{}
 
 	if params.Sentiment != "" {
@@ -100,14 +92,12 @@ func (r *repository) ListComments(ctx context.Context, params ListParams) ([]Com
 		args = append(args, *params.Until)
 	}
 
+	query := "SELECT comment_id, text, sentiment, status, event_time, processed_at FROM comments"
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
 	args = append(args, params.Limit, params.Offset)
-	query := `
-SELECT comment_id, text, sentiment, status, event_time, processed_at
-FROM comments
-WHERE ` + strings.Join(where, " AND ") + `
-ORDER BY event_time DESC
-LIMIT $` + strconv.Itoa(len(args)-1) + ` OFFSET $` + strconv.Itoa(len(args)) + `
-`
+	query += " ORDER BY event_time DESC LIMIT $" + strconv.Itoa(len(args)-1) + " OFFSET $" + strconv.Itoa(len(args))
 
 	rows, err := r.pool.Query(ctx, query, args...)
 	if err != nil {
@@ -135,7 +125,7 @@ LIMIT $` + strconv.Itoa(len(args)-1) + ` OFFSET $` + strconv.Itoa(len(args)) + `
 }
 
 // GetComment fetches a single comment by ID.
-func (r *repository) GetComment(ctx context.Context, commentID string) (Comment, error) {
+func (r *Repository) GetComment(ctx context.Context, commentID string) (Comment, error) {
 	const query = `
 SELECT comment_id, text, sentiment, status, event_time, processed_at
 FROM comments
@@ -161,7 +151,7 @@ WHERE comment_id = $1
 }
 
 // LoadCommentForProcessing fetches the fields needed by the worker.
-func (r *repository) LoadCommentForProcessing(ctx context.Context, commentID string) (*CommentProcessing, error) {
+func (r *Repository) LoadCommentForProcessing(ctx context.Context, commentID string) (*CommentProcessing, error) {
 	const query = `
 SELECT comment_id, text, text_hash, status, attempt_count
 FROM comments
@@ -175,7 +165,7 @@ WHERE comment_id = $1
 		&row.Status,
 		&row.AttemptCount,
 	); err != nil {
-		if err == pgx.ErrNoRows {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
@@ -184,7 +174,7 @@ WHERE comment_id = $1
 }
 
 // LoadCommentPayload fetches the payload fields for outbox publishing.
-func (r *repository) LoadCommentPayload(ctx context.Context, commentID string) (CommentPayload, error) {
+func (r *Repository) LoadCommentPayload(ctx context.Context, commentID string) (CommentPayload, error) {
 	const query = `
 SELECT event_id, event_time, text
 FROM comments
@@ -205,7 +195,7 @@ WHERE comment_id = $1
 }
 
 // MarkCommentProcessed updates the comment and inserts the outbox entry in a transaction.
-func (r *repository) MarkCommentProcessed(ctx context.Context, commentID, label string, processedAt time.Time, payload []byte) error {
+func (r *Repository) MarkCommentProcessed(ctx context.Context, commentID, label string, processedAt time.Time, payload []byte) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -238,8 +228,21 @@ VALUES ($1, $2)
 	return tx.Commit(ctx)
 }
 
-// MarkCommentFailure updates the comment with failure details.
-func (r *repository) MarkCommentFailure(ctx context.Context, commentID string, attemptCount int, lastErr string, status string) error {
+// MarkAsTerminallyFailed terminates a comment without touching attempt_count.
+// Used when the worker classifies an error as non-retryable.
+func (r *Repository) MarkAsTerminallyFailed(ctx context.Context, commentID, lastErr string) error {
+	_, err := r.pool.Exec(ctx, `
+UPDATE comments
+SET status = 'failed',
+    last_error = $1,
+    updated_at = NOW()
+WHERE comment_id = $2
+`, lastErr, commentID)
+	return err
+}
+
+// RecordRetryableFailure updates the comment with failure details.
+func (r *Repository) RecordRetryableFailure(ctx context.Context, commentID string, attemptCount int, lastErr string, status string) error {
 	_, err := r.pool.Exec(ctx, `
 UPDATE comments
 SET attempt_count = $1,
@@ -252,7 +255,7 @@ WHERE comment_id = $4
 }
 
 // UpsertComment inserts or updates a comment if the event_time is newer.
-func (r *repository) UpsertComment(ctx context.Context, params UpsertCommentParams) (bool, error) {
+func (r *Repository) UpsertComment(ctx context.Context, params UpsertCommentParams) (bool, error) {
 	cmd, err := r.pool.Exec(ctx, `
 INSERT INTO comments (comment_id, event_id, event_time, text, text_hash, status, attempt_count, created_at, updated_at)
 VALUES ($1, $2, $3, $4, $5, 'pending', 0, NOW(), NOW())

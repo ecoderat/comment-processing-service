@@ -40,3 +40,16 @@ func GetEnvDuration(key string, fallback time.Duration) time.Duration {
 func LoadEnv() {
 	_ = godotenv.Load()
 }
+
+// Config holds shared values consumed by more than one binary, where keeping
+// the default in a single place avoids drift between binaries.
+type Config struct {
+	RetryZSet string
+}
+
+// Load reads shared config from the environment, applying defaults.
+func Load() Config {
+	return Config{
+		RetryZSet: GetEnv("RETRY_ZSET", "retry:zset"),
+	}
+}

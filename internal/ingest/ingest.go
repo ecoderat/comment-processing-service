@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/segmentio/kafka-go"
@@ -17,18 +18,24 @@ import (
 
 type Config struct {
 	IdempotencyTTL time.Duration
+	RetryZSet      string
+}
+
+// CommentWriter is the slice of the repository this service depends on.
+type CommentWriter interface {
+	UpsertComment(ctx context.Context, params repository.UpsertCommentParams) (bool, error)
 }
 
 type Service struct {
 	reader *kafka.Reader
-	repo   repository.Repository
-	cache  cache.Cache
+	repo   CommentWriter
+	cache  *cache.Client
 	cfg    Config
 	logger *logrus.Logger
 }
 
 // NewService builds an ingest service with dependencies.
-func NewService(reader *kafka.Reader, repo repository.Repository, cacheClient cache.Cache, cfg Config, logger *logrus.Logger) *Service {
+func NewService(reader *kafka.Reader, repo CommentWriter, cacheClient *cache.Client, cfg Config, logger *logrus.Logger) *Service {
 	if logger == nil {
 		logger = logrus.StandardLogger()
 	}
@@ -73,9 +80,8 @@ func (s *Service) handleMessage(ctx context.Context, msg kafka.Message) error {
 		return nil
 	}
 
-	eventTime, err := time.Parse(time.RFC3339Nano, payload.EventTime)
-	if err != nil {
-		s.logger.WithError(err).WithFields(logrus.Fields{
+	if payload.EventTime.IsZero() {
+		s.logger.WithFields(logrus.Fields{
 			"event_id":   payload.EventID,
 			"comment_id": payload.CommentID,
 		}).Warn("invalid event_time")
@@ -112,7 +118,7 @@ func (s *Service) handleMessage(ctx context.Context, msg kafka.Message) error {
 	upserted, err := s.repo.UpsertComment(ctx, repository.UpsertCommentParams{
 		CommentID: payload.CommentID,
 		EventID:   payload.EventID,
-		EventTime: eventTime,
+		EventTime: payload.EventTime,
 		Text:      payload.Text,
 		TextHash:  textHash,
 	})
@@ -129,17 +135,8 @@ func (s *Service) handleMessage(ctx context.Context, msg kafka.Message) error {
 		return nil
 	}
 
-	for {
-		if err := s.cache.EnqueueRetry(ctx, payload.CommentID); err != nil {
-			s.logger.WithError(err).WithField("comment_id", payload.CommentID).Error("enqueue retry error")
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(200 * time.Millisecond):
-			}
-			continue
-		}
-		break
+	if err := s.cache.EnqueueRetry(ctx, s.cfg.RetryZSet, payload.CommentID); err != nil {
+		return fmt.Errorf("enqueue retry %s: %w", payload.CommentID, err)
 	}
 
 	s.logger.WithFields(logrus.Fields{

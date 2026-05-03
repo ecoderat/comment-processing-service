@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"errors"
 	"strconv"
 	"time"
@@ -16,8 +17,14 @@ type CommentController interface {
 	GetComment(c fiber.Ctx) error
 }
 
+// CommentReader is the slice of the repository this controller depends on.
+type CommentReader interface {
+	ListComments(ctx context.Context, params repository.ListParams) ([]repository.Comment, error)
+	GetComment(ctx context.Context, commentID string) (repository.Comment, error)
+}
+
 type commentController struct {
-	repo   repository.Repository
+	repo   CommentReader
 	logger *logrus.Logger
 }
 
@@ -36,7 +43,7 @@ type ListResponse struct {
 	Offset   int               `json:"offset"`
 }
 
-func NewCommentController(repo repository.Repository, logger *logrus.Logger) CommentController {
+func NewCommentController(repo CommentReader, logger *logrus.Logger) CommentController {
 	if logger == nil {
 		logger = logrus.StandardLogger()
 	}

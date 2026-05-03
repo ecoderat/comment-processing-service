@@ -2,15 +2,13 @@ package producer
 
 import (
 	"context"
-	crand "crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"math"
-	"math/big"
 	"math/rand"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/segmentio/kafka-go"
 	"github.com/sirupsen/logrus"
 
@@ -29,11 +27,7 @@ type Config struct {
 	Seed          int64
 }
 
-type Service interface {
-	Run(ctx context.Context) error
-}
-
-type service struct {
+type Service struct {
 	cfg    Config
 	writer *kafka.Writer
 	rng    *rand.Rand
@@ -41,7 +35,7 @@ type service struct {
 }
 
 // NewService builds a producer service with its writer and RNG.
-func NewService(cfg Config, logger *logrus.Logger) Service {
+func NewService(cfg Config, logger *logrus.Logger) *Service {
 	if logger == nil {
 		logger = logrus.StandardLogger()
 	}
@@ -50,7 +44,7 @@ func NewService(cfg Config, logger *logrus.Logger) Service {
 		Topic:    cfg.Topic,
 		Balancer: &kafka.Hash{},
 	})
-	return &service{
+	return &Service{
 		cfg:    cfg,
 		writer: writer,
 		rng:    rand.New(rand.NewSource(cfg.Seed)),
@@ -59,7 +53,7 @@ func NewService(cfg Config, logger *logrus.Logger) Service {
 }
 
 // Run emits raw comments to Kafka until the context is cancelled.
-func (s *service) Run(ctx context.Context) error {
+func (s *Service) Run(ctx context.Context) error {
 	defer func() {
 		_ = s.writer.Close()
 	}()
@@ -85,8 +79,8 @@ func (s *service) Run(ctx context.Context) error {
 
 		text := generateText(s.rng, s.cfg.Size, &recentTexts, clampPercent(s.cfg.ReusePercent))
 		msg := model.RawComment{
-			EventID:   newUUID(),
-			EventTime: time.Now().UTC().Format(time.RFC3339Nano),
+			EventID:   uuid.NewString(),
+			EventTime: time.Now().UTC(),
 			CommentID: randomID(s.rng, 12),
 			Text:      text,
 		}
@@ -164,31 +158,6 @@ func clampPercent(v int) int {
 	return v
 }
 
-func newUUID() string {
-	var b [16]byte
-	_, err := crand.Read(b[:])
-	if err != nil {
-		return randomHex(16)
-	}
-	b[6] = (b[6] & 0x0f) | 0x40
-	b[8] = (b[8] & 0x3f) | 0x80
-	return formatUUID(b[:])
-}
-
-func formatUUID(b []byte) string {
-	buf := make([]byte, 36)
-	hex.Encode(buf[0:8], b[0:4])
-	buf[8] = '-'
-	hex.Encode(buf[9:13], b[4:6])
-	buf[13] = '-'
-	hex.Encode(buf[14:18], b[6:8])
-	buf[18] = '-'
-	hex.Encode(buf[19:23], b[8:10])
-	buf[23] = '-'
-	hex.Encode(buf[24:36], b[10:16])
-	return string(buf)
-}
-
 func randomID(rng *rand.Rand, n int) string {
 	const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
 	b := make([]byte, n)
@@ -196,19 +165,6 @@ func randomID(rng *rand.Rand, n int) string {
 		b[i] = alphabet[rng.Intn(len(alphabet))]
 	}
 	return string(b)
-}
-
-func randomHex(n int) string {
-	max := new(big.Int).Lsh(big.NewInt(1), uint(n*4))
-	v, err := crand.Int(crand.Reader, max)
-	if err != nil {
-		return "0000000000000000"
-	}
-	s := v.Text(16)
-	if len(s) < n {
-		return strings.Repeat("0", n-len(s)) + s
-	}
-	return s
 }
 
 var loremWords = []string{

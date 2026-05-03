@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"comment-processing-service/internal/config"
@@ -18,7 +21,8 @@ import (
 func main() {
 	config.LoadEnv()
 
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	dsn := config.GetEnv("DATABASE_URL", "")
 	if dsn == "" {
@@ -59,7 +63,7 @@ func main() {
 		LoopInterval: loopInterval,
 	}
 	service := outbox.NewService(repo, writer, cfg, logrus.StandardLogger())
-	if err := service.Run(ctx); err != nil {
+	if err := service.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		logrus.StandardLogger().WithError(err).Fatal("outbox stopped")
 	}
 }

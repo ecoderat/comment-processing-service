@@ -16,11 +16,7 @@ type Config struct {
 	LoopInterval time.Duration
 }
 
-type Service interface {
-	Run(ctx context.Context) error
-}
-
-type service struct {
+type Service struct {
 	repo   repository.OutboxRepository
 	writer *kafka.Writer
 	cfg    Config
@@ -28,15 +24,15 @@ type service struct {
 }
 
 // NewService builds an outbox service with dependencies.
-func NewService(repo repository.OutboxRepository, writer *kafka.Writer, cfg Config, logger *logrus.Logger) Service {
+func NewService(repo repository.OutboxRepository, writer *kafka.Writer, cfg Config, logger *logrus.Logger) *Service {
 	if logger == nil {
 		logger = logrus.StandardLogger()
 	}
-	return &service{repo: repo, writer: writer, cfg: cfg, logger: logger}
+	return &Service{repo: repo, writer: writer, cfg: cfg, logger: logger}
 }
 
 // Run publishes outbox rows to Kafka.
-func (s *service) Run(ctx context.Context) error {
+func (s *Service) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
